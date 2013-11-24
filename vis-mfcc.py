@@ -24,12 +24,15 @@ class PoorPlotter(gtk.DrawingArea):
 
         self._mel_data = ()
         self._freq_data = ()
+        self._frameno = None
 
-    def set_data(self, mel_data=None, freq_data=None):
+    def set_data(self, mel_data=None, freq_data=None, frameno=None):
         if mel_data is not None:
             self._mel_data = mel_data
         if freq_data is not None:
             self._freq_data = freq_data
+        if frameno is not None:
+            self._frameno = frameno
 
     def pt2xy(self, pt):
         xspan = self._xrange[1] - self._xrange[0]
@@ -98,6 +101,14 @@ class PoorPlotter(gtk.DrawingArea):
             cr.move_to(px - self._labeloffs[0] - extents[2], py + 0.5*extents[3])
             cr.show_text(label)
 
+        if self._frameno is not None:
+            label = 'Frame %d' % self._frameno
+            extents = cr.text_extents(label)
+
+            px,py = self.pt2xy((self._xrange[1], self._yrange[0]))
+            cr.move_to(px - self._labeloffs[0] - extents[2], py + self._labeloffs[1] + extents[3])
+            cr.show_text(label)
+
         def plot_line(data):
             for idx,(x,y) in enumerate(data):
                 px,py = self.pt2xy((x,y))
@@ -106,9 +117,11 @@ class PoorPlotter(gtk.DrawingArea):
                 else:
                     cr.line_to(px,py)
 
+        cr.set_source_rgb(0.5, 0.5, 0.5)
         plot_line(self._freq_data)
         cr.stroke()
 
+        cr.set_source_rgb(0., 0., 0.)
         cr.set_line_width(2.)
         plot_line(self._mel_data)
         cr.stroke()
@@ -123,34 +136,69 @@ class MFCCWatcher(object):
     def __init__(self, vis):
         self._vis = vis
         self._reader = None
+        self._frameno = 0
+        self.push_data = True
 
-    def __call__(self, source, condition):
+    def data_available(self, source, condition):
         if self._reader is None:
             self._reader = MFCCReader(source)
             return True
 
+        return self.forward()
+
+    def forward(self):
         try:
             mel, freq = next(self._reader)
         except StopIteration:
             return False
 
+        self._frameno += 1
         mel = zip(self._reader.mel_freqs[1:], mel)
         freq = zip(self._reader.fft_freqs, freq)
 
-        self._vis.set_data(mel_data = mel, freq_data = freq)
-        self._vis.queue_draw()
+        if self.push_data:
+            self._vis.set_data(mel_data = mel, freq_data = freq, frameno = self._frameno)
+            self._vis.queue_draw()
         return True
+
+    def backward(self):
+        if self._frameno <= 1:
+            return False
+        self._reader.seek(-2)
+        self._frameno -= 2
+        return self.forward()
 
 def main():
     vis = PoorPlotter()
 
+    try:
+        sys.stdin.seek(0, 1)
+        stdin_seekable = True
+    except IOError:
+        stdin_seekable = False;
+
+    watcher = MFCCWatcher(vis)
+    if not stdin_seekable:
+        glib.io_add_watch(sys.stdin, glib.IO_IN, watcher.data_available)
+    else:
+        watcher.data_available(sys.stdin, None)
+
+    def keypress(widget, event):
+        if not stdin_seekable:
+            if event.keyval == gtk.keysyms.space:
+                watcher.push_data = not watcher.push_data
+        else:
+            if event.keyval == gtk.keysyms.Left:
+                watcher.backward()
+            elif event.keyval == gtk.keysyms.Right:
+                watcher.forward()
+
     window = gtk.Window()
     window.connect("delete-event", gtk.main_quit)
+    window.connect("key-press-event", keypress)
     window.add(vis)
     window.set_position(gtk.WIN_POS_CENTER)
     window.show_all()
-   
-    glib.io_add_watch(sys.stdin, glib.IO_IN, MFCCWatcher(vis))
 
     gtk.main()
 
