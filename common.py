@@ -12,12 +12,12 @@ class MFCCReader(object):
         except IOError:
             self.seekable = False
 
-        self.mel_filters, n_fft_freqs = self._read_fmt('ii')
+        self.mel_filters, self.fft_length, self.dct_length = self._read_fmt('iii')
 
         self.mel_freqs = self._read_fmt('%df' % self.mel_filters)
-        self.fft_freqs = self._read_fmt('%df' % n_fft_freqs)
+        self.fft_freqs = self._read_fmt('%df' % self.fft_length)
 
-        self._framefmt = '%df' % (self.mel_filters + n_fft_freqs)
+        self._framefmt = '%df' % (self.mel_filters + self.fft_length + self.dct_length)
         self._framesize = struct.calcsize(self._framefmt)
 
     def _read_fmt(self, fmt):
@@ -39,4 +39,6 @@ class MFCCReader(object):
             raise StopIteration
 
         frame = struct.unpack(self._framefmt, buf)
-        return frame[:self.mel_filters], frame[self.mel_filters:]
+        return frame[ : self.mel_filters], \
+               frame[self.mel_filters : self.mel_filters+self.fft_length], \
+               frame[self.mel_filters+self.fft_length : ]

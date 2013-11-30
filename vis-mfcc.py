@@ -148,7 +148,7 @@ class MFCCWatcher(object):
 
     def forward(self):
         try:
-            mel, freq = next(self._reader)
+            mel, freq, dct = next(self._reader)
         except StopIteration:
             return False
 

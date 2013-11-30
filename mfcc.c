@@ -16,6 +16,9 @@ static int frame_spacing = 160; /* 10 ms */
 
 static int mel_filters = 26;
 static float mel_high_freq = 8000.f; /* Hz */
+static float mel_power_threshold = -70.f; /* dB */
+
+static int dct_length = 13; /* mel filters / 2 */
 
 typedef int16_t sample_t;
 
@@ -26,9 +29,14 @@ struct {
 static fftw_complex *fft_in, *fft_out;
 static fftw_plan fft_plan;
 
+static double *dct_in, *dct_out;
+static fftw_plan dct_plan;
+
+static int fft_length;
 static float *window;
 static float *fft_freqs, *fft_power;
 static float *mel_freqs, *mel_power;
+static float *dct_coeffs;
 
 static inline float sample_to_float(sample_t s) {
     return (float)s / 32768.f;
@@ -39,6 +47,12 @@ static inline float hz_to_mel(float hz) {
 static inline float mel_to_hz(float mel) {
     return 700.f * (expf(mel/1125.f) - 1.f);
 }
+static inline float power_to_db(float p) {
+    return logf(p) * 4.3429448f; /* decibels */
+}
+static inline float db_to_power(float p) {
+    return expf(0.23025851f * p);
+}
 
 static void process_frame(const sample_t *samples)
 {
@@ -47,14 +61,16 @@ static void process_frame(const sample_t *samples)
 
     fftw_execute(fft_plan);
     
-    for(int i=0; i<frame_length/2; i++)
+    for(int i=0; i<fft_length; i++)
     {
         float re = crealf(fft_out[i]) / frame_length,
               im = cimagf(fft_out[i]) / frame_length,
               power = re*re + im*im;
         if(i != 0) power *= 2.f;
-        fft_power[i] = logf(power) / 0.2302585092994046f; /* decibels */
+        fft_power[i] = power;
     }
+
+    float min_mel_power = db_to_power(mel_power_threshold);
 
     for(int j=0; j<mel_filters; j++)
     {
@@ -62,22 +78,27 @@ static void process_frame(const sample_t *samples)
               mid = mel_freqs[j+1],
               high = mel_freqs[j+2];
 
-        float num = 0, denom = 0;
+        float accum = 0;
         
-        for(int i=0; i<frame_length/2; i++)
+        for(int i=0; i<fft_length; i++)
         {
             float freq = fft_freqs[i];
             if(freq <= lo || freq >= high)
                 continue;
 
-            float weight =
-                (freq < mid) ? (freq-lo) / (mid-lo) : (high-freq) / (high-mid);
-            num += weight * fft_power[i];
-            denom += weight;
+            accum += fft_power[i] *
+                ((freq < mid)  ?  (freq-lo) / (mid-lo) :  (high-freq) / (high-mid));
         }
-
-        mel_power[j] = num / denom;
+        
+        dct_in[j] = mel_power[j] = power_to_db(accum + min_mel_power);
     }
+
+    for(int i=0; i<fft_length; i++)
+        fft_power[i] = power_to_db(fft_power[i]);
+
+    fftw_execute(dct_plan);
+    for(int i=0; i<dct_length; i++)
+        dct_coeffs[i] = (float)(dct_out[i] / (2*mel_filters));
 }
 
 static void initialize()
@@ -89,20 +110,29 @@ static void initialize()
     fft_in = fftw_alloc_complex(frame_length);
     fft_out = fftw_alloc_complex(frame_length);
 
+    dct_in = malloc(sizeof(double) * mel_filters);
+    dct_out = malloc(sizeof(double) * mel_filters);
+
     fft_plan = fftw_plan_dft_1d(frame_length, fft_in, fft_out, FFTW_FORWARD, FFTW_MEASURE);
+    dct_plan = fftw_plan_r2r_1d(mel_filters, dct_in, dct_out, FFTW_REDFT10, FFTW_MEASURE);
 
     window = malloc(sizeof(float) * frame_length);
     
-    fft_freqs = malloc(sizeof(float) * (frame_length/2));
-    fft_power = malloc(sizeof(float) * (frame_length/2));
+    fft_length = frame_length / 2;
+    fft_freqs = malloc(sizeof(float) * fft_length);
+    fft_power = malloc(sizeof(float) * fft_length);
 
     mel_freqs = malloc(sizeof(float) * (mel_filters+2));
     mel_power = malloc(sizeof(float) * mel_filters);
+   
+    dct_length = mel_filters / 2; 
+    dct_coeffs = malloc(sizeof(float) * dct_length);
 
+    /* Hann's window */
     for(int i=0; i<frame_length; i++)
-        window[i] = .5f - .5f*cosf((float)(2. * M_PI) * i / (frame_length-1));
+        window[i] = .5f - .5f*cosf((float)(2. * M_PI) * i / frame_length);
     
-    for(int i=0; i<frame_length/2; i++)
+    for(int i=0; i<fft_length; i++)
         fft_freqs[i] = (float)(sample_rate * i) / frame_length;
 
     float mel_step = hz_to_mel(mel_high_freq) / (mel_filters+1);
@@ -119,7 +149,7 @@ static void say_hello()
             "%d mel filters:", sample_rate, frame_length, frame_spacing, mel_filters);
     for(int i=0; i<mel_filters+2; i++)
         ptr += sprintf(ptr, " %.1f Hz", mel_freqs[i]);
-    ptr += sprintf(ptr, "\n");
+    ptr += sprintf(ptr, "\n%d dct coefficients\n", dct_length);
 
     fputs(buf, stderr);
 }
@@ -127,6 +157,8 @@ static void say_hello()
 static void cleanup()
 {
     fflush(stdout);
+
+    free(dct_coeffs);
 
     free(mel_power);
     free(mel_freqs);
@@ -136,7 +168,12 @@ static void cleanup()
 
     free(window);
 
+    fftw_destroy_plan(dct_plan);
     fftw_destroy_plan(fft_plan);
+
+    free(dct_out);
+    free(dct_in);
+
     fftw_free(fft_out);
     fftw_free(fft_in);
 
@@ -164,12 +201,12 @@ int main(void)
     initialize();
     say_hello();
 
-    int n_fft_freqs = frame_length/2;
     fwrite(&mel_filters, sizeof(int), 1, stdout);
-    fwrite(&n_fft_freqs, sizeof(int), 1, stdout);
+    fwrite(&fft_length,  sizeof(int), 1, stdout);
+    fwrite(&dct_length,  sizeof(int), 1, stdout);
 
     fwrite(mel_freqs, sizeof(float)*mel_filters, 1, stdout);
-    fwrite(fft_freqs, sizeof(float)*n_fft_freqs, 1, stdout);
+    fwrite(fft_freqs, sizeof(float)*fft_length, 1, stdout);
 
     int stdin_flags = get_stdin_flags();
     stdin_flags |= O_NONBLOCK;
@@ -219,8 +256,9 @@ int main(void)
             set_stdin_flags(stdin_flags |= O_NONBLOCK);
 
         process_frame((const sample_t *)inbuf.rdptr);
-        fwrite(mel_power, sizeof(float)*mel_filters, 1, stdout);
-        fwrite(fft_power, sizeof(float)*(frame_length/2), 1, stdout);
+        fwrite(mel_power,  sizeof(float)*mel_filters, 1, stdout);
+        fwrite(fft_power,  sizeof(float)*fft_length, 1, stdout);
+        fwrite(dct_coeffs, sizeof(float)*dct_length, 1, stdout);
         
         frame_count += 1;
         inbuf.rdptr += frame_offs;
