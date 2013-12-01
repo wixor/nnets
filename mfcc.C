@@ -29,24 +29,12 @@ static inline float db_to_power(float p) {
     return expf(0.23025851f * p);
 }
 
-#if 0
-static int sample_rate = 16000; /* 16 kHz */
-static int frame_length = 400; /* 25 ms */
-static int frame_spacing = 160; /* 10 ms */
-
-static int mel_filters = 26;
-static float mel_high_freq = 8000.f; /* Hz */
-static float mel_power_threshold = -70.f; /* dB */
-
-static int dct_length = 13; /* mel filters / 2 */
-#endif
-
-
 class mfcc
 {
 public:
     int sample_rate;
     int frame_length;
+    int num_channels;
 
     int mel_filters;
     float mel_power_offs;
@@ -70,6 +58,7 @@ public:
     struct profile {
         int sample_rate;
         int frame_length;
+        int num_channels;
         int mel_filters;
         float mel_high_freq;
         float mel_power_threshold;
@@ -85,6 +74,7 @@ mfcc::mfcc(const mfcc::profile &p)
 {
     sample_rate = p.sample_rate;
     frame_length = p.frame_length;
+    num_channels = p.num_channels;
 
     mel_filters = p.mel_filters;
     mel_power_offs = db_to_power(p.mel_power_threshold);
@@ -148,8 +138,12 @@ mfcc::~mfcc()
 
 void mfcc::process_frame(const sample_t *samples)
 {
-    for(int i=0; i<frame_length; i++)
-        fft_in[i] = sample_to_float(samples[i]) * window[i];
+    if(1 == num_channels)
+        for(int i=0; i<frame_length; i++)
+            fft_in[i] = sample_to_float(samples[i]) * window[i];
+    else
+        for(int i=0; i<frame_length; i++)
+            fft_in[i] = .5f * (sample_to_float(samples[2*i]) + sample_to_float(samples[2*i+1])) * window[i];
 
     fftw_execute(fft_plan);
     
@@ -216,7 +210,8 @@ public:
 
     inline const sample_t *get_samples() const { return (const sample_t *)rdptr; }
     inline int get_sample_rate() const { return sample_rate; }
-    inline void advance(int step) { rdptr += sizeof(sample_t) * step; }
+    inline int get_num_channels() const { return num_channels; }
+    inline void advance(int step) { rdptr += sizeof(sample_t) * num_channels * step; }
 };
 
 class wav_streamer : public streamer
@@ -302,8 +297,8 @@ class streamer* streamer::init(int fd, int buffer_size)
     else
         ret = new wav_streamer(fd, buffer_size, lookahead, sizeof(lookahead));
 
-    if(1 != ret->num_channels) {
-        fputs("only mono streams are supported", stderr);
+    if(1 != ret->num_channels && 2 != ret->num_channels) {
+        fputs("only mono or stereo streams are supported", stderr);
         exit(EXIT_FAILURE);
     }
     if(16 != ret->bits_per_sample) {
@@ -401,13 +396,13 @@ void wav_streamer::shutdown() {
 
 enum streamer::read_status wav_streamer::read(int samples)
 {
-    int frame_bytes = sizeof(sample_t) * samples;
+    int frame_bytes = sizeof(sample_t) * samples * num_channels;
 
     need_buffer_space(frame_bytes);
 
     while(wrptr - rdptr < frame_bytes)
     {
-        int rc = ::read(fd, wrptr, endptr - wrptr);
+        ssize_t rc = ::read(fd, wrptr, endptr - wrptr);
 
         if(0 == rc) {
             memset(wrptr, 0, endptr - wrptr);
@@ -482,7 +477,7 @@ void vorbis_streamer::shutdown() {
 
 enum streamer::read_status vorbis_streamer::read(int samples)
 {
-    int frame_bytes = sizeof(sample_t) * samples;
+    int frame_bytes = sizeof(sample_t) * samples * num_channels;
     
     need_buffer_space(frame_bytes);
 
@@ -512,7 +507,7 @@ enum streamer::read_status vorbis_streamer::read(int samples)
 
 int main(void)
 {
-    class streamer *streamer = streamer::init(STDIN_FILENO, 4096);
+    class streamer *streamer = streamer::init(STDIN_FILENO, 8192);
 
     int sample_rate = streamer->get_sample_rate();
     int frame_length = sample_rate / 40;
@@ -521,6 +516,7 @@ int main(void)
     struct mfcc::profile profile = {
         .sample_rate = sample_rate,
         .frame_length = frame_length,
+        .num_channels = streamer->get_num_channels(),
         .mel_filters = 26,
         .mel_high_freq = 8000.f,
         .mel_power_threshold = -70.f,
@@ -554,7 +550,7 @@ int main(void)
     int frame_count = 0;
     for(;;)
     {
-        enum streamer::read_status rc = streamer->read(profile.frame_length);
+        enum streamer::read_status rc = streamer->read(mfcc.frame_length);
         if(rc == streamer::READ_EOF)
             break;
         if(rc == streamer::READ_STALL)
@@ -570,6 +566,8 @@ int main(void)
             frame_count += 1;
         }
     }
+
+    fflush(stdout);
 
     fprintf(stderr, "processed %d frames\n", frame_count);
 
