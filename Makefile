@@ -1,6 +1,6 @@
-CC := gcc
-CFLAGS := -std=gnu99 -msse -msse2 -mfpmath=sse -march=native -ffast-math -O2 -Wall -Wshadow $(shell pkg-config --cflags fftw3)
-LDFLAGS := -lm $(shell pkg-config --libs fftw3)
+CXX := g++
+CXXFLAGS := -msse -msse2 -mfpmath=sse -march=native -ffast-math -O2 -Wall -Wshadow $(shell pkg-config --cflags fftw3 vorbisfile)
+LDFLAGS := -lm $(shell pkg-config --libs fftw3 vorbisfile)
 
-mfcc: mfcc.c
+mfcc: mfcc.C
 
