@@ -11,6 +11,24 @@
 #include <fftw3.h>
 #include <vorbis/vorbisfile.h>
 
+static struct {
+    float frame_sec;
+    float step_sec;
+    int mel_filters;
+    float mel_high_freq;
+    float mel_power_threshold;
+    int dct_length;
+} config = {
+    .frame_sec = 0.025f,
+    .step_sec = 0.010f,
+    .mel_filters = 26,
+    .mel_high_freq = 8000.f,
+    .mel_power_threshold = -70.f,
+    .dct_length = 13
+};
+
+/* ------------------------------------------------------------------------- */
+
 typedef int16_t sample_t;
 
 static inline float sample_to_float(sample_t s) {
@@ -339,16 +357,21 @@ void wav_streamer::parse_wav(char *lookahead, size_t lookahead_size)
 {
     struct wavhdr hdr;
 
-    ssize_t remaining = sizeof(hdr) - lookahead_size;
     memcpy(&hdr, lookahead, lookahead_size);
-    ssize_t rc = ::read(fd, (char *)&hdr + lookahead_size, remaining);
-    if(-1 == rc) {
-        perror("read");
-        exit(EXIT_FAILURE);
-    }
-    if(remaining != rc) {
-        fputs("truncated wav file", stderr);
-        exit(EXIT_FAILURE);
+
+    ssize_t remaining = sizeof(hdr) - lookahead_size;
+    while(remaining > 0)
+    {
+        ssize_t rc = ::read(fd, (char *)&hdr + lookahead_size, remaining);
+        if(-1 == rc) {
+            perror("read");
+            exit(EXIT_FAILURE);
+        }
+        if(0 == rc) {
+            fputs("truncated wav file", stderr);
+            exit(EXIT_FAILURE);
+        }
+        remaining -= rc;
     }
 
     if(0 != memcmp(hdr.riff_format, "WAVE", 4) ||
@@ -505,22 +528,22 @@ enum streamer::read_status vorbis_streamer::read(int samples)
 
 /* -------------------------------------------------------------------------- */
 
-int main(void)
+static int sub_pipe(int argc, char *argv[])
 {
     class streamer *streamer = streamer::init(STDIN_FILENO, 8192);
 
     int sample_rate = streamer->get_sample_rate();
-    int frame_length = sample_rate / 40;
-    int frame_spacing = sample_rate / 100;
+    int frame_length = (int)(config.frame_sec * sample_rate);
+    int frame_spacing = (int)(config.step_sec * sample_rate);
 
     struct mfcc::profile profile = {
         .sample_rate = sample_rate,
         .frame_length = frame_length,
         .num_channels = streamer->get_num_channels(),
-        .mel_filters = 26,
-        .mel_high_freq = 8000.f,
-        .mel_power_threshold = -70.f,
-        .dct_length = 13
+        .mel_filters = config.mel_filters,
+        .mel_high_freq = config.mel_high_freq,
+        .mel_power_threshold = config.mel_power_threshold,
+        .dct_length = config.dct_length
     };
 
     class mfcc mfcc(profile);
@@ -575,3 +598,146 @@ int main(void)
 
     return 0;
 }
+
+/* -------------------------------------------------------------------------- */
+
+class mlf_parser
+{
+public:
+    enum line_type {
+        FILE_START, LABEL, FILE_END, NO_LINE
+    };
+
+private:
+    FILE *fp;
+    char buffer[128];
+
+    enum line_type type;
+    const char *filename;
+    long long label_start;
+    long long label_end;
+    const char *label_value;
+
+    inline void read_line() {
+        buffer[0] = '\0';
+        fgets(buffer, sizeof(buffer), fp);
+    }
+
+public:
+    mlf_parser(const char *mlffile);
+    ~mlf_parser();
+
+    bool next_line();
+    inline enum line_type get_line_type() const { return type; }
+    inline const char* get_filename() const { return filename; }
+    inline long long get_label_start() const { return label_start; }
+    inline long long get_label_end() const { return label_end; }
+    inline const char *get_label_value() const { return label_value; }
+};
+
+mlf_parser::mlf_parser(const char *mlffile)
+{
+    fp = fopen(mlffile, "r");
+    if(NULL == fp) {
+        perror("failed to open mlf file: fopen");
+        exit(EXIT_FAILURE);
+    }
+
+    read_line();
+
+    if(0 != memcmp("#!MLF!#", buffer, 7)) {
+        fputs("mlf signature missing", stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+mlf_parser::~mlf_parser() {
+    fclose(fp);
+}
+
+bool mlf_parser::next_line()
+{
+    do 
+        read_line();
+    while('\n' == buffer[0] || '\r' == buffer[0]);
+
+    if('\0' == buffer[0]) {
+        type = mlf_parser::NO_LINE;
+        filename = label_value = NULL;
+        label_start = label_end = 0LL;
+        return false;
+    }
+
+    if('.' == buffer[0]) {
+        type = mlf_parser::FILE_END;
+        filename = label_value = NULL;
+        label_start = label_end = 0LL;
+        return true;
+    }
+    if('"' == buffer[0]) {
+        type = mlf_parser::FILE_START;
+        
+        filename = buffer+3;
+        *strchrnul(buffer, '.') = '\0';
+        
+        label_value = NULL;
+        label_start = label_end = 0LL;
+        return true;
+    }
+    {
+        type = mlf_parser::LABEL;
+        filename = NULL;
+
+        const char *delim = " \n\t\r";
+        char *saveptr, *p;
+        p = strtok_r(buffer, delim, &saveptr);
+        label_start = strtoll(p, NULL, 10);
+
+        p = strtok_r(NULL, delim, &saveptr);
+        label_end = strtoll(p, NULL, 10);
+
+        p = strtok_r(NULL, delim, &saveptr);
+        label_value = p;
+        return true;
+    }
+}
+
+static int sub_corpora(int argc, char *argv[])
+{
+    if(argc != 3) {
+        fputs("USAGE: mfcc corpora [mlf file]\n", stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    mlf_parser mlf(argv[2]);
+
+    while(mlf.next_line()) {
+        switch(mlf.get_line_type()) {
+            case mlf_parser::FILE_START:
+                printf("file %s\n", mlf.get_filename());
+                break;
+            case mlf_parser::LABEL:
+                printf("  %s at %lld -- %lld\n", mlf.get_label_value(), mlf.get_label_start(), mlf.get_label_end());
+                break;
+        }
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+
+int main(int argc, char *argv[])
+{
+    if(argc < 2) {
+        fputs("USAGE: mfcc [subprogram] [options...]\n", stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if(strcmp(argv[1], "pipe") == 0)
+        return sub_pipe(argc, argv);
+    if(strcmp(argv[1], "corpora") == 0)
+        return sub_corpora(argc, argv);
+
+    fputs("unknown subprogram; available: pipe, corpora\n", stderr);
+    exit(EXIT_FAILURE);
+}
+
