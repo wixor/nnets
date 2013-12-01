@@ -2,7 +2,7 @@
 
 import sys, math
 import gtk, glib
-from common import MFCCReader
+from common import MFCCReader, SeekableMFCCReader
 
 class PoorPlotter(gtk.DrawingArea):
 
@@ -24,15 +24,15 @@ class PoorPlotter(gtk.DrawingArea):
 
         self._mel_data = ()
         self._freq_data = ()
-        self._frameno = None
+        self._label = None
 
-    def set_data(self, mel_data=None, freq_data=None, frameno=None):
+    def set_data(self, mel_data=None, freq_data=None, label=None):
         if mel_data is not None:
             self._mel_data = mel_data
         if freq_data is not None:
             self._freq_data = freq_data
-        if frameno is not None:
-            self._frameno = frameno
+        if label is not None:
+            self._label = label
 
     def pt2xy(self, pt):
         xspan = self._xrange[1] - self._xrange[0]
@@ -101,13 +101,12 @@ class PoorPlotter(gtk.DrawingArea):
             cr.move_to(px - self._labeloffs[0] - extents[2], py + 0.5*extents[3])
             cr.show_text(label)
 
-        if self._frameno is not None:
-            label = 'Frame %d' % self._frameno
-            extents = cr.text_extents(label)
+        if self._label is not None:
+            extents = cr.text_extents(self._label)
 
             px,py = self.pt2xy((self._xrange[1], self._yrange[0]))
             cr.move_to(px - self._labeloffs[0] - extents[2], py + self._labeloffs[1] + extents[3])
-            cr.show_text(label)
+            cr.show_text(self._label)
 
         def plot_line(data):
             for idx,(x,y) in enumerate(data):
@@ -132,66 +131,66 @@ class PoorPlotter(gtk.DrawingArea):
             cr.arc(px,py, self._dotradius, 0, 2.*math.pi)
         cr.fill()
 
-class MFCCWatcher(object):
-    def __init__(self, vis):
+class MFCCBrowser(object):
+    def __init__(self, reader, vis):
         self._vis = vis
-        self._reader = None
-        self._frameno = 0
+        self._reader = reader
         self.push_data = True
-
-    def data_available(self, source, condition):
-        if self._reader is None:
-            self._reader = MFCCReader(source)
-            return True
-
-        return self.forward()
 
     def forward(self):
         try:
-            mel, freq, dct = next(self._reader)
+            while True:
+                packet = next(self._reader)
+                if isinstance(packet, MFCCReader.FramePacket):
+                    break
         except StopIteration:
             return False
 
-        self._frameno += 1
-        mel = zip(self._reader.mel_freqs[1:], mel)
-        freq = zip(self._reader.fft_freqs, freq)
-
-        if self.push_data:
-            self._vis.set_data(mel_data = mel, freq_data = freq, frameno = self._frameno)
-            self._vis.queue_draw()
+        self.push_to_vis(packet)
         return True
 
     def backward(self):
-        if self._frameno <= 1:
-            return False
-        self._reader.seek(-2)
-        self._frameno -= 2
-        return self.forward()
+        self.push_to_vis(self._reader.seek(-1))
+        return True
+
+    def push_to_vis(self, frame):
+        if not self.push_data:
+            return
+
+        group_header = frame.group_header
+        profile = group_header.profile
+
+        mel = zip(profile.mel_freqs[1:], frame.mel_powers)
+        freq = zip(profile.fft_freqs, frame.fft_powers)
+
+        label = 'file %s, label %s, sample offset %d' % (group_header.filename, group_header.label, frame.sample_offset)
+
+        self._vis.set_data(mel_data = mel, freq_data = freq, label = label)
+        self._vis.queue_draw()
 
 def main():
     vis = PoorPlotter()
 
-    try:
-        sys.stdin.seek(0, 1)
-        stdin_seekable = True
-    except IOError:
-        stdin_seekable = False;
+    reader = MFCCReader(sys.stdin)
+    if reader.seekable:
+        reader = SeekableMFCCReader(reader)
 
-    watcher = MFCCWatcher(vis)
-    if not stdin_seekable:
-        glib.io_add_watch(sys.stdin, glib.IO_IN, watcher.data_available)
+    browser = MFCCBrowser(reader, vis)
+
+    if not reader.seekable:
+        glib.io_add_watch(sys.stdin, glib.IO_IN, lambda source,condition: browser.forward())
     else:
-        watcher.data_available(sys.stdin, None)
+        browser.forward()
 
     def keypress(widget, event):
-        if not stdin_seekable:
+        if not reader.seekable:
             if event.keyval == gtk.keysyms.space:
-                watcher.push_data = not watcher.push_data
+                browser.push_data = not browser.push_data
         else:
             if event.keyval == gtk.keysyms.Left:
-                watcher.backward()
+                browser.backward()
             elif event.keyval == gtk.keysyms.Right:
-                watcher.forward()
+                browser.forward()
 
     window = gtk.Window()
     window.connect("delete-event", gtk.main_quit)

@@ -12,6 +12,7 @@
 #include <vorbis/vorbisfile.h>
 
 static struct {
+    int streamer_buffer;
     float frame_sec;
     float step_sec;
     int mel_filters;
@@ -19,12 +20,13 @@ static struct {
     float mel_power_threshold;
     int dct_length;
 } config = {
+    .streamer_buffer = 8192,
     .frame_sec = 0.025f,
     .step_sec = 0.010f,
     .mel_filters = 26,
     .mel_high_freq = 8000.f,
     .mel_power_threshold = -70.f,
-    .dct_length = 13
+    .dct_length = 13,
 };
 
 /* ------------------------------------------------------------------------- */
@@ -50,84 +52,94 @@ static inline float db_to_power(float p) {
 class mfcc
 {
 public:
-    int sample_rate;
-    int frame_length;
-    int num_channels;
-
-    int mel_filters;
-    float mel_power_offs;
-
-    int dct_length;
-
-    fftw_complex *fft_in, *fft_out;
-    fftw_plan fft_plan;
-
-    double *dct_in, *dct_out;
-    fftw_plan dct_plan;
-
-    int fft_length;
-    float *window;
-    float *fft_freqs, *fft_power;
-    float *mel_freqs, *mel_power;
-    float *dct_coeffs;
-
-    /* --- */
-
-    struct profile {
+    struct profile
+    {
         int sample_rate;
         int frame_length;
+        int frame_spacing;
         int num_channels;
         int mel_filters;
         float mel_high_freq;
         float mel_power_threshold;
         int dct_length;
+        
+        bool operator==(const struct profile &p) const
+        {
+            return sample_rate == p.sample_rate &&
+                   frame_length == p.frame_length &&
+                   frame_spacing == p.frame_spacing &&
+                   num_channels == p.num_channels &&
+                   mel_filters == p.mel_filters &&
+                   mel_high_freq == p.mel_high_freq &&
+                   mel_power_threshold == p.mel_power_threshold &&
+                   dct_length == p.dct_length;
+        }
+        
+        inline bool operator!=(const profile &p) const {
+            return !((*this) == p);
+        }
     };
 
-    mfcc(const mfcc::profile &s);
+    struct profile p;
+
+    float mel_power_offs;
+
+    int fft_length;
+    fftw_complex *fft_in, *fft_out;
+    fftw_plan fft_plan;
+
+    int dct_length;
+    double *dct_in, *dct_out;
+    fftw_plan dct_plan;
+
+    float *window;
+    float *fft_freqs, *fft_power;
+    float *mel_freqs, *mel_power;
+    float *dct_coeffs;
+
+
+    mfcc(const struct mfcc::profile &_p);
     ~mfcc();
     void process_frame(const sample_t *samples);
 };
 
-mfcc::mfcc(const mfcc::profile &p)
+mfcc::mfcc(const struct mfcc::profile &_p)
 {
-    sample_rate = p.sample_rate;
-    frame_length = p.frame_length;
-    num_channels = p.num_channels;
+    p = _p;
 
-    mel_filters = p.mel_filters;
     mel_power_offs = db_to_power(p.mel_power_threshold);
 
-    fft_in = fftw_alloc_complex(frame_length);
-    fft_out = fftw_alloc_complex(frame_length);
+    fft_in = fftw_alloc_complex(p.frame_length);
+    fft_out = fftw_alloc_complex(p.frame_length);
 
-    dct_in = (double *)malloc(sizeof(double) * mel_filters);
-    dct_out = (double *)malloc(sizeof(double) * mel_filters);
+    dct_in = (double *)malloc(sizeof(double) * p.mel_filters);
+    dct_out = (double *)malloc(sizeof(double) * p.mel_filters);
 
-    fft_plan = fftw_plan_dft_1d(frame_length, fft_in, fft_out, FFTW_FORWARD, FFTW_MEASURE);
-    dct_plan = fftw_plan_r2r_1d(mel_filters, dct_in, dct_out, FFTW_REDFT10, FFTW_MEASURE);
+    fft_plan = fftw_plan_dft_1d(p.frame_length, fft_in, fft_out, FFTW_FORWARD, FFTW_MEASURE);
+    dct_plan = fftw_plan_r2r_1d(p.mel_filters, dct_in, dct_out, FFTW_REDFT10, FFTW_MEASURE);
 
-    window = (float *)malloc(sizeof(float) * frame_length);
+    window = (float *)malloc(sizeof(float) * p.frame_length);
     
-    fft_length = frame_length / 2;
+    fft_length = p.frame_length / 2;
     fft_freqs = (float *)malloc(sizeof(float) * fft_length);
     fft_power = (float *)malloc(sizeof(float) * fft_length);
 
-    mel_freqs = (float *)malloc(sizeof(float) * (mel_filters+2));
-    mel_power = (float *)malloc(sizeof(float) * mel_filters);
+    mel_freqs = (float *)malloc(sizeof(float) * (p.mel_filters+2));
+    mel_power = (float *)malloc(sizeof(float) * p.mel_filters);
    
-    dct_length = mel_filters / 2; 
+    dct_length = p.mel_filters / 2; 
     dct_coeffs = (float *)malloc(sizeof(float) * dct_length);
 
     /* Hann's window */
-    for(int i=0; i<frame_length; i++)
-        window[i] = .5f - .5f*cosf((float)(2. * M_PI) * i / frame_length);
+    for(int i=0; i<p.frame_length; i++)
+        window[i] = .5f - .5f*cosf((float)(2. * M_PI) * i / p.frame_length);
     
     for(int i=0; i<fft_length; i++)
-        fft_freqs[i] = (float)(sample_rate * i) / frame_length;
+        fft_freqs[i] = (float)(p.sample_rate * i) / p.frame_length;
 
     mel_power_offs = db_to_power(p.mel_power_threshold);
-    float mel_step = hz_to_mel(p.mel_high_freq) / (mel_filters+1);
-    for(int i=0; i<mel_filters+2; i++)
+    float mel_step = hz_to_mel(p.mel_high_freq) / (p.mel_filters+1);
+    for(int i=0; i<p.mel_filters+2; i++)
         mel_freqs[i] = mel_to_hz(mel_step * i);
 }
 
@@ -156,25 +168,25 @@ mfcc::~mfcc()
 
 void mfcc::process_frame(const sample_t *samples)
 {
-    if(1 == num_channels)
-        for(int i=0; i<frame_length; i++)
+    if(1 == p.num_channels)
+        for(int i=0; i<p.frame_length; i++)
             fft_in[i] = sample_to_float(samples[i]) * window[i];
     else
-        for(int i=0; i<frame_length; i++)
+        for(int i=0; i<p.frame_length; i++)
             fft_in[i] = .5f * (sample_to_float(samples[2*i]) + sample_to_float(samples[2*i+1])) * window[i];
 
     fftw_execute(fft_plan);
     
     for(int i=0; i<fft_length; i++)
     {
-        float re = crealf(fft_out[i]) / frame_length,
-              im = cimagf(fft_out[i]) / frame_length,
+        float re = crealf(fft_out[i]) / p.frame_length,
+              im = cimagf(fft_out[i]) / p.frame_length,
               power = re*re + im*im;
         if(i != 0) power *= 2.f;
         fft_power[i] = power;
     }
 
-    for(int j=0; j<mel_filters; j++)
+    for(int j=0; j<p.mel_filters; j++)
     {
         float lo = mel_freqs[j],
               mid = mel_freqs[j+1],
@@ -200,7 +212,7 @@ void mfcc::process_frame(const sample_t *samples)
 
     fftw_execute(dct_plan);
     for(int i=0; i<dct_length; i++)
-        dct_coeffs[i] = (float)(dct_out[i] / (2*mel_filters));
+        dct_coeffs[i] = (float)(dct_out[i] / (2*p.mel_filters));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -211,6 +223,7 @@ protected:
     int fd;
     char *buf, *rdptr, *wrptr, *endptr;
     int num_channels, sample_rate, bits_per_sample;
+    int sample_offset;
 
     streamer(int _fd, int buffer_size);
     void need_buffer_space(int frame_bytes);
@@ -229,7 +242,14 @@ public:
     inline const sample_t *get_samples() const { return (const sample_t *)rdptr; }
     inline int get_sample_rate() const { return sample_rate; }
     inline int get_num_channels() const { return num_channels; }
-    inline void advance(int step) { rdptr += sizeof(sample_t) * num_channels * step; }
+    inline int get_sample_offset() const { return sample_offset; }
+
+    inline void advance(int step) {
+        rdptr += sizeof(sample_t) * num_channels * step;
+        sample_offset += step;
+    }
+
+    void make_profile(struct mfcc::profile *profile) const;
 };
 
 class wav_streamer : public streamer
@@ -289,6 +309,7 @@ streamer::streamer(int _fd, int buffer_size)
     buf = (char *)malloc(sizeof(sample_t) * buffer_size);
     rdptr = wrptr = buf;
     endptr = buf + sizeof(sample_t) * buffer_size;
+    sample_offset = 0;
 }
 
 streamer::~streamer()
@@ -335,6 +356,19 @@ void streamer::need_buffer_space(int frame_bytes)
         wrptr = buf + (wrptr - rdptr);
         rdptr = buf;
     }
+}
+
+void streamer::make_profile(struct mfcc::profile *profile) const
+{
+    profile->sample_rate = get_sample_rate();
+    profile->frame_length = (int)(config.frame_sec * profile->sample_rate);
+    profile->frame_spacing = (int)(config.step_sec * profile->sample_rate);
+    profile->num_channels = get_num_channels();
+
+    profile->mel_filters = config.mel_filters;
+    profile->mel_high_freq = config.mel_high_freq;
+    profile->mel_power_threshold = config.mel_power_threshold;
+    profile->dct_length = config.dct_length;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -528,23 +562,101 @@ enum streamer::read_status vorbis_streamer::read(int samples)
 
 /* -------------------------------------------------------------------------- */
 
+class outstream
+{
+    FILE *fp;
+
+    inline FILE *get_fp() {
+        if(NULL == fp)
+            fp = stdout;
+        return fp;
+    }
+
+    enum packets {
+        PACKET_PROFILE = 1,
+        PACKET_GROUP_HDR = 2,
+        PACKET_FRAME = 3
+    };
+
+    inline void out_buf(const void *data, size_t len) {
+        fwrite(data, len, 1, get_fp());
+    }
+    inline void out_int(uint32_t x) {
+        out_buf(&x, sizeof(x));
+    }
+    inline void out_short(int16_t x) {
+        out_buf(&x, sizeof(x));
+    }
+    inline void out_byte(int8_t x) {
+        out_buf(&x, sizeof(x));
+    }
+
+public:
+    outstream();
+    outstream(FILE *_fp);
+
+    inline void flush() {
+        fflush(get_fp());
+    }
+
+    void write_profile(const mfcc &mfcc);
+    void write_group_hdr(const char *filename, const char *label, int sample_offset);
+    void write_frame(const mfcc &mfcc);
+};
+
+static outstream out;
+
+outstream::outstream() {
+    fp = NULL;
+}
+outstream::outstream(FILE *_fp) {
+    fp = _fp;
+}
+void outstream::write_profile(const mfcc &mfcc)
+{
+    out_byte(PACKET_PROFILE);
+
+    out_short(mfcc.p.frame_length);
+    out_short(mfcc.p.frame_spacing);
+    out_short(mfcc.p.sample_rate);
+    out_byte(mfcc.p.mel_filters);
+    out_byte(mfcc.dct_length);
+    out_short(mfcc.fft_length);
+
+    out_buf(mfcc.mel_freqs, sizeof(float)*mfcc.p.mel_filters);
+    out_buf(mfcc.fft_freqs, sizeof(float)*mfcc.fft_length);
+}
+void outstream::write_group_hdr(const char *filename, const char *label, int sample_offset)
+{
+    int filename_len = strlen(filename),
+        label_len = strlen(label);
+
+    out_byte(PACKET_GROUP_HDR);
+
+    out_byte(filename_len);
+    out_byte(label_len);
+    out_int(sample_offset);
+
+    out_buf(filename, filename_len);
+    out_buf(label, label_len);
+}
+void outstream::write_frame(const mfcc &mfcc)
+{
+    out_byte(PACKET_FRAME);
+
+    out_buf(mfcc.mel_power,  sizeof(float)*mfcc.p.mel_filters);
+    out_buf(mfcc.fft_power,  sizeof(float)*mfcc.fft_length);
+    out_buf(mfcc.dct_coeffs, sizeof(float)*mfcc.dct_length);
+}
+
+/* -------------------------------------------------------------------------- */
+
 static int sub_pipe(int argc, char *argv[])
 {
-    class streamer *streamer = streamer::init(STDIN_FILENO, 8192);
+    class streamer *streamer = streamer::init(STDIN_FILENO, config.streamer_buffer);
 
-    int sample_rate = streamer->get_sample_rate();
-    int frame_length = (int)(config.frame_sec * sample_rate);
-    int frame_spacing = (int)(config.step_sec * sample_rate);
-
-    struct mfcc::profile profile = {
-        .sample_rate = sample_rate,
-        .frame_length = frame_length,
-        .num_channels = streamer->get_num_channels(),
-        .mel_filters = config.mel_filters,
-        .mel_high_freq = config.mel_high_freq,
-        .mel_power_threshold = config.mel_power_threshold,
-        .dct_length = config.dct_length
-    };
+    struct mfcc::profile profile;
+    streamer->make_profile(&profile);
 
     class mfcc mfcc(profile);
 
@@ -554,43 +666,36 @@ static int sub_pipe(int argc, char *argv[])
         ptr += sprintf(ptr,
                 "sample rate %d Hz; frame length: %d samples, frame spacing: %d samples\n"
                 "%d mel filters:",
-                mfcc.sample_rate, frame_length, frame_spacing, mfcc.mel_filters);
+                profile.sample_rate, profile.frame_length, profile.frame_spacing, profile.mel_filters);
 
-        for(int i=0; i<mfcc.mel_filters+2; i++)
+        for(int i=0; i<profile.mel_filters+2; i++)
             ptr += sprintf(ptr, " %.1f Hz", mfcc.mel_freqs[i]);
         ptr += sprintf(ptr, "\n%d dct coefficients\n", mfcc.dct_length);
 
         fputs(buf, stderr);
     }
 
-    fwrite(&mfcc.mel_filters, sizeof(int), 1, stdout);
-    fwrite(&mfcc.fft_length,  sizeof(int), 1, stdout);
-    fwrite(&mfcc.dct_length,  sizeof(int), 1, stdout);
-
-    fwrite(mfcc.mel_freqs, sizeof(float)*mfcc.mel_filters, 1, stdout);
-    fwrite(mfcc.fft_freqs, sizeof(float)*mfcc.fft_length, 1, stdout);
+    out.write_profile(mfcc);
+    out.write_group_hdr("pipe", "?", 0);
 
     int frame_count = 0;
     for(;;)
     {
-        enum streamer::read_status rc = streamer->read(mfcc.frame_length);
+        enum streamer::read_status rc = streamer->read(profile.frame_length);
         if(rc == streamer::READ_EOF)
             break;
         if(rc == streamer::READ_STALL)
-            fflush(stdout);
+            out.flush();
         else {
             mfcc.process_frame(streamer->get_samples());
-            streamer->advance(frame_spacing);
+            streamer->advance(profile.frame_spacing);
 
-            fwrite(mfcc.mel_power,  sizeof(float)*mfcc.mel_filters, 1, stdout);
-            fwrite(mfcc.fft_power,  sizeof(float)*mfcc.fft_length, 1, stdout);
-            fwrite(mfcc.dct_coeffs, sizeof(float)*mfcc.dct_length, 1, stdout);
-        
+            out.write_frame(mfcc);
             frame_count += 1;
         }
     }
 
-    fflush(stdout);
+    out.flush();
 
     fprintf(stderr, "processed %d frames\n", frame_count);
 
@@ -701,26 +806,170 @@ bool mlf_parser::next_line()
     }
 }
 
-static int sub_corpora(int argc, char *argv[])
+class sub_corpora
+{
+    char basedir[128];
+    char path[128];
+
+    int fd;
+    class streamer *streamer;
+    class mfcc *mfcc;
+    struct mfcc::profile profile;
+
+    sub_corpora();
+    ~sub_corpora();
+
+    void drop_streamer();
+    void drop_mfcc();
+
+    int run(int argc, char *argv[]);
+
+    void open_file(const char *filename);
+    void process_slice(long long label_start, long long label_end, const char *label_value);
+
+public:
+    static inline int main(int argc, char *argv[]) {
+        return sub_corpora().run(argc, argv);
+    }
+};
+
+sub_corpora::sub_corpora() {
+    fd = -1;
+    streamer = NULL;
+    mfcc = NULL;
+}
+sub_corpora::~sub_corpora() {
+    drop_streamer();
+    drop_mfcc();
+}
+
+void sub_corpora::drop_streamer() {
+    if(-1 != fd) {
+        close(fd);
+        fd = -1;
+    }
+    if(NULL != streamer) {
+        delete streamer;
+        streamer = NULL;
+    }
+}
+void sub_corpora::drop_mfcc() {
+    if(NULL != mfcc) {
+        delete mfcc;
+        mfcc = NULL;
+    }
+}
+
+int sub_corpora::run(int argc, char *argv[])
 {
     if(argc != 3) {
         fputs("USAGE: mfcc corpora [mlf file]\n", stderr);
         exit(EXIT_FAILURE);
     }
 
+    {
+        strcpy(basedir, argv[2]);
+        char *slash = strrchr(basedir, '/');
+        if(NULL != slash)
+            slash[1] = '\0';
+        else
+            basedir[0] = '\0';
+
+        fprintf(stderr, "opening MLF file %s; base directory: %s\n", argv[2], basedir);
+    }
+
     mlf_parser mlf(argv[2]);
 
-    while(mlf.next_line()) {
+    while(mlf.next_line())
         switch(mlf.get_line_type()) {
             case mlf_parser::FILE_START:
-                printf("file %s\n", mlf.get_filename());
+                open_file(mlf.get_filename());
                 break;
-            case mlf_parser::LABEL:
-                printf("  %s at %lld -- %lld\n", mlf.get_label_value(), mlf.get_label_start(), mlf.get_label_end());
+            case mlf_parser::FILE_END:
+                drop_streamer();
+                break;
+             case mlf_parser::LABEL:
+                process_slice(mlf.get_label_start(), mlf.get_label_end(), mlf.get_label_value());
+                break;
+            default:
                 break;
         }
-    }
+
     return 0;
+}
+
+void sub_corpora::open_file(const char *filename)
+{
+    drop_streamer();
+
+    sprintf(path, "%s%s.ogg", basedir, filename);
+    fprintf(stderr, "opening file %s\n", path);
+
+    fd = open(path, O_RDONLY);
+    if(-1 == fd) {
+        perror("open");
+        exit(EXIT_FAILURE);
+    }
+
+    streamer = streamer::init(fd, config.streamer_buffer);
+
+    struct mfcc::profile new_profile;
+    streamer->make_profile(&new_profile);
+
+    if(NULL == mfcc || new_profile != profile)
+    {
+        fputs("creating new mfcc profile...\n", stderr);
+        profile = new_profile;
+
+        drop_mfcc();
+        mfcc = new class mfcc(profile);
+
+        out.write_profile(*mfcc);
+    }
+}
+
+void sub_corpora::process_slice(long long label_start, long long label_end, const char *label_value)
+{
+    if(label_start == label_end)
+        return;
+
+    float lbl_start = label_start * 1e-7f,
+          lbl_end = label_end * 1e-7f;
+
+    float frame_duration = (float)profile.frame_length / profile.sample_rate;
+
+    bool need_header = true;
+
+    for(;;)
+    {
+        enum streamer::read_status rc = streamer->read(profile.frame_length);
+        if(rc == streamer::READ_EOF)
+            break;
+
+        int sample_offset = streamer->get_sample_offset();
+        float time_offset = (float)sample_offset / profile.sample_rate;
+        
+        if(time_offset + frame_duration <= lbl_start) {
+            streamer->advance(profile.frame_spacing);
+            continue;
+        }
+
+        if(time_offset >= lbl_end)
+            break;
+
+        if(need_header) {
+            out.write_group_hdr(path, label_value, sample_offset);
+            need_header = false;
+        }
+
+        mfcc->process_frame(streamer->get_samples());
+        streamer->advance(profile.frame_spacing);
+        out.write_frame(*mfcc);
+    }
+
+    if(need_header)
+        fprintf(stderr, "warning: label %s (range %lld -- %lld) in file %s did not hit any frame\n", 
+                label_value, label_start, label_end, path);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -735,7 +984,7 @@ int main(int argc, char *argv[])
     if(strcmp(argv[1], "pipe") == 0)
         return sub_pipe(argc, argv);
     if(strcmp(argv[1], "corpora") == 0)
-        return sub_corpora(argc, argv);
+        return sub_corpora::main(argc, argv);
 
     fputs("unknown subprogram; available: pipe, corpora\n", stderr);
     exit(EXIT_FAILURE);
