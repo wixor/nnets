@@ -2,20 +2,20 @@
 
 import itertools, collections, struct
 
+ProfilePacket = collections.namedtuple('ProfilePacket', 
+    ('seq',
+     'frame_length', 'frame_spacing', 'sample_rate',
+     'mel_filters', 'fft_length', 'mel_freqs', 'fft_freqs'))
+GroupHeaderPacket = collections.namedtuple('GroupHeaderPacket', 
+    ('seq', 'profile', 'filename', 'label', 'sample_offset'))
+FramePacket = collections.namedtuple('FramePacket', 
+    ('seq', 'group_header', 'mel_powers', 'fft_powers', 'dct_coeffs', 'wvl_coeffs', 'sample_offset'))
+
+PROFILE_PACKET_ID = 1
+GROUP_HEADER_PACKET_ID = 2
+FRAME_PACKET_ID = 3
+
 class MFCCReader(object):
-    ProfilePacket = collections.namedtuple('ProfilePacket', 
-        ('seq',
-         'frame_length', 'frame_spacing', 'sample_rate',
-         'mel_filters', 'fft_length', 'mel_freqs', 'fft_freqs'))
-    GroupHeaderPacket = collections.namedtuple('GroupHeaderPacket', 
-        ('seq', 'profile', 'filename', 'label', 'sample_offset'))
-    FramePacket = collections.namedtuple('FramePacket', 
-        ('seq', 'group_header', 'mel_powers', 'fft_powers', 'dct_coeffs', 'wvl_coeffs', 'sample_offset'))
-
-    PROFILE_PACKET_ID = 1
-    GROUP_HEADER_PACKET_ID = 2
-    FRAME_PACKET_ID = 3
-
     def __init__(self, f):
         self._f = f
         self.current_profile = None
@@ -45,14 +45,14 @@ class MFCCReader(object):
             raise StopIteration
         (packet_id,) = struct.unpack('=b', packet_id)
 
-        if MFCCReader.PROFILE_PACKET_ID == packet_id:
+        if PROFILE_PACKET_ID == packet_id:
             mel_filters, fft_length, \
             frame_length, frame_spacing, sample_rate = self._read_fmt('=bhhhh')
 
             x = self._read_fmt('=%df' % (mel_filters + fft_length))
 
             self._profile_seq += 1
-            self.current_profile = MFCCReader.ProfilePacket(
+            self.current_profile = ProfilePacket(
                 seq = self._profile_seq,
                 frame_length = frame_length,
                 frame_spacing = frame_spacing,
@@ -64,13 +64,13 @@ class MFCCReader(object):
             )
             return self.current_profile
 
-        if MFCCReader.GROUP_HEADER_PACKET_ID == packet_id:
+        if GROUP_HEADER_PACKET_ID == packet_id:
             filename_len, label_len, sample_offset = self._read_fmt('=bbi')
             filename, label = self._read_fmt('=%ds%ds' % (filename_len, label_len))
 
             self._sample_offset = sample_offset
             self._group_header_seq += 1
-            self.current_group_header = MFCCReader.GroupHeaderPacket(
+            self.current_group_header = GroupHeaderPacket(
                 seq = self._group_header_seq,
                 profile = self.current_profile,
                 filename = filename,
@@ -79,7 +79,7 @@ class MFCCReader(object):
             )
             return self.current_group_header 
 
-        if MFCCReader.FRAME_PACKET_ID == packet_id:
+        if FRAME_PACKET_ID == packet_id:
             profile = self.current_profile
             x = self._read_fmt('=%df' % (3*profile.mel_filters + profile.fft_length))
             x = iter(x)
@@ -89,7 +89,7 @@ class MFCCReader(object):
             wvl_coeffs = list(itertools.islice(x, profile.mel_filters))
 
             self._frame_seq += 1
-            frame = MFCCReader.FramePacket(
+            frame = FramePacket(
                 seq = self._frame_seq,
                 group_header = self.current_group_header,
                 mel_powers = mel_powers,
@@ -108,11 +108,11 @@ class MFCCReader(object):
         group_headers = []
         frames = []
         for packet in self:
-            if isinstance(packet, MFCCReader.ProfilePacket):
+            if isinstance(packet, ProfilePacket):
                 profiles.append(packet)
-            if isinstance(packet, MFCCReader.GroupHeaderPacket):
+            if isinstance(packet, GroupHeaderPacket):
                 group_headers.append(packet)
-            if isinstance(packet, MFCCReader.FramePacket):
+            if isinstance(packet, FramePacket):
                 frames.append(packet)
         return (profiles, group_headers, frames)
 
@@ -129,7 +129,7 @@ class SeekableMFCCReader(object):
     def get_current_frame(self):
         while self.hindex >= len(self.history):
             packet = next(self._reader)
-            if isinstance(packet, MFCCReader.FramePacket):
+            if isinstance(packet, FramePacket):
                 self.history.append(packet)
         return self.history[self.hindex]
 
@@ -155,3 +155,49 @@ class SeekableMFCCReader(object):
             self.hindex = len(self.history)-1
             return self.history[self.hindex]
 
+class MFCCWriter(object):
+    def __init__(self, f):
+        self._f = f
+
+    def _read_fmt(self, fmt):
+        size = struct.calcsize(fmt)
+        return struct.unpack(fmt, self._f.read(size))
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        packet_id = self._f.read(1)
+        if len(packet_id) < 1:
+            raise StopIteration
+        (packet_id,) = struct.unpack('=b', packet_id)
+
+    def _write_profile(self, packet):
+        self._f.write(struct.pack(
+            '=bbhhhh%df' % (packet.mel_filters + packet.fft_length),
+            PROFILE_PACKET_ID,
+            packet.mel_filters, packet.fft_length,
+            packet.frame_length, packet.frame_spacing, packet.sample_rate,
+            *(packet.mel_freqs + packet.fft_freqs)
+        ))
+
+    def _write_group_header(self, packet):
+        self._f.write(struct.pack(
+            '=bbbi%ds%ds' % (len(packet.filename), len(packet.label)),
+            GROUP_HEADER_PACKET_ID,
+            len(packet.filename), len(packet.label), packet.sample_offset,
+            packet.filename, packet.label
+        ))
+
+    def _write_frame(self, packet):
+        x = packet.mel_powers + packet.fft_powers + packet.dct_coeffs + packet.wvl_coeffs
+        self._f.write(struct.pack('=b%df' % len(x), FRAME_PACKET_ID, *x))
+
+    def write(self, packet):
+        if isinstance(packet, ProfilePacket):
+            return self._write_profile(packet)
+        if isinstance(packet, GroupHeaderPacket):
+            return self._write_group_header(packet)
+        if isinstance(packet, FramePacket):
+            return self._write_frame(packet)
+        raise TypeError('unsupported packet type ' + type(packet))

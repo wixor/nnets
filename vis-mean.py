@@ -9,13 +9,13 @@ class PoorPlotter(gtk.DrawingArea):
     def __init__(self):
         super(PoorPlotter, self).__init__()
         self.connect("expose_event", self.expose)
-        self.set_size_request(1024,256)
+        self.set_size_request(900,128)
 
         self._margins = (10.5,15.5,20.5,30.5)
-        self._xtics = tuple(xrange(0,8001,1000))
-        self._ytics = tuple(xrange(-10,-141,-10))
-        self._xrange = (0,8000)
-        self._yrange = (-10,-140)
+        self._xtics = tuple(xrange(0,7001,1000))
+        self._ytics = tuple(xrange(-10,-71,-10))
+        self._xrange = (0,7000)
+        self._yrange = (-10,-70)
         self._ticksize = 5
         self._labeloffs = (5,5)
         self._dotradius = 3
@@ -116,85 +116,33 @@ class PoorPlotter(gtk.DrawingArea):
                 else:
                     cr.line_to(px,py)
 
-        cr.set_source_rgb(0.5, 0.5, 0.5)
-        plot_line(self._freq_data)
-        cr.stroke()
-
-        cr.set_source_rgb(0., 0., 0.)
-        cr.set_line_width(2.)
-        plot_line(self._mel_data)
-        cr.stroke()
-
-        for x,y in self._mel_data:
-            px,py = self.pt2xy((x,y))
-            cr.new_sub_path()
-            cr.arc(px,py, self._dotradius, 0, 2.*math.pi)
-        cr.fill()
-
-class MFCCBrowser(object):
-    def __init__(self, reader, vis):
-        self._vis = vis
-        self._reader = reader
-        self.push_data = True
-
-    def forward(self):
-        try:
-            while True:
-                packet = next(self._reader)
-                if isinstance(packet, FramePacket):
-                    break
-        except StopIteration:
-            return False
-
-        self.push_to_vis(packet)
-        return True
-
-    def backward(self):
-        self.push_to_vis(self._reader.seek(-1))
-        return True
-
-    def push_to_vis(self, frame):
-        if not self.push_data:
-            return
-
-        group_header = frame.group_header
-        profile = group_header.profile
-
-        mel = zip(profile.mel_freqs[1:], frame.mel_powers)
-        freq = zip(profile.fft_freqs, frame.fft_powers)
-
-        label = 'file %s, label %s, sample offset %d' % (group_header.filename, group_header.label, frame.sample_offset)
-
-        self._vis.set_data(mel_data = mel, freq_data = freq, label = label)
-        self._vis.queue_draw()
+        cr.set_source_rgba(0., 0., 0., .015)
+        for x in self._mel_data:
+            plot_line(x)
+            cr.stroke()
 
 def main():
+    if len(sys.argv) != 3:
+        sys.stderr.write('USAGE: vis-mean.py [input mfcc file] [label]\n')
+        sys.exit(1)
+
+
+    in_file = open(sys.argv[1], 'rb') if sys.argv[1] != '-' else sys.stdin
+    reader = MFCCReader(in_file)
+
+    label = sys.argv[2]
+
+    profiles, _, frames = reader.read_all()
+    profile = profiles[0]
+
+    mel_data = [ zip(profile.mel_freqs, f.mel_powers)
+                for f in frames if f.group_header.label == label ]
+
     vis = PoorPlotter()
-
-    reader = MFCCReader(sys.stdin)
-    if reader.seekable:
-        reader = SeekableMFCCReader(reader)
-
-    browser = MFCCBrowser(reader, vis)
-
-    if not reader.seekable:
-        glib.io_add_watch(sys.stdin, glib.IO_IN, lambda source,condition: browser.forward())
-    else:
-        browser.forward()
-
-    def keypress(widget, event):
-        if not reader.seekable:
-            if event.keyval == gtk.keysyms.space:
-                browser.push_data = not browser.push_data
-        else:
-            if event.keyval == gtk.keysyms.Left:
-                browser.backward()
-            elif event.keyval == gtk.keysyms.Right:
-                browser.forward()
+    vis.set_data(mel_data = mel_data, label = "mean for label " + label)
 
     window = gtk.Window()
     window.connect("delete-event", gtk.main_quit)
-    window.connect("key-press-event", keypress)
     window.add(vis)
     window.set_position(gtk.WIN_POS_CENTER)
     window.show_all()
