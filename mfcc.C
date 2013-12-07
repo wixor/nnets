@@ -18,7 +18,6 @@ static struct {
     int mel_filters;
     float mel_high_freq;
     float mel_power_threshold;
-    int dct_length;
 } config = {
     .streamer_buffer = 8192,
     .frame_sec = 0.025f,
@@ -26,7 +25,6 @@ static struct {
     .mel_filters = 26,
     .mel_high_freq = 8000.f,
     .mel_power_threshold = -70.f,
-    .dct_length = 13,
 };
 
 /* ------------------------------------------------------------------------- */
@@ -49,6 +47,77 @@ static inline float db_to_power(float p) {
     return expf(0.23025851f * p);
 }
 
+/* ------------------------------------------------------------------------- */
+
+#define WAVELET_BORDER 6
+
+static inline float wavelet_predict(float a, float b, float c, float d) {
+    return (9.f * (a + b) - (c + d)) * 0.0625;
+}
+static inline float wavelet_update(float a, float b, float c, float d) {
+    return .5f * (a + b);
+}
+
+static void wavelet_mirror(float *aux, int n)
+{
+    aux[-1] = aux[1];
+    aux[n] = aux[n-2];
+    aux[-2] = aux[2];
+    aux[n+1] = aux[n-3];
+    aux[-3] = aux[3];
+    aux[n+2] = aux[n-4];
+}
+
+static inline void wavelet_forward_step(float *buf, float *aux, int n)
+{
+    memcpy(aux, buf, n*sizeof(float));
+    
+    wavelet_mirror(aux, n);
+    for(int i=1; i<n; i+=2)
+        aux[i] -= wavelet_predict(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
+    
+    wavelet_mirror(aux, n);
+    for(int i=0; i<n; i+=2)
+        aux[i] += wavelet_update(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
+    
+    for(int i=0; 2*i<n; i++)
+        buf[i] = aux[2*i];
+    for(int i=0; 2*i+1<n; i++)
+        buf[i + (n+1)/2] = aux[2*i+1];
+}
+static inline void wavelet_backward_step(float *buf, float *aux, int n)
+{
+    for(int i=0; 2*i<n; i++)
+        aux[2*i] = buf[i];
+    for(int i=0; 2*i+1<n; i++)
+        aux[2*i+1] = buf[i + (n+1)/2];
+
+    wavelet_mirror(aux, n);
+    for(int i=0; i<n; i+=2)
+        aux[i] -= wavelet_update(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
+    
+    wavelet_mirror(aux, n);
+    for(int i=1; i<n; i+=2)
+        aux[i] += wavelet_predict(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
+   
+    memcpy(buf, aux, sizeof(float)*n); 
+}
+
+static void wavelet_forward(float *buf, float *aux, int n) {
+    if(n < 2)
+        return;
+    wavelet_forward_step(buf, aux+(WAVELET_BORDER/2), n);
+    wavelet_forward(buf, aux, (n+1)/2);
+}
+static void wavelet_backward(float *buf, float *aux, int n) {
+    if(n < 2)
+        return;
+    wavelet_backward(buf, aux, (n+1)/2);
+    wavelet_backward_step(buf, aux+(WAVELET_BORDER/2), n);
+}
+
+/* ------------------------------------------------------------------------- */
+
 class mfcc
 {
 public:
@@ -61,7 +130,6 @@ public:
         int mel_filters;
         float mel_high_freq;
         float mel_power_threshold;
-        int dct_length;
         
         bool operator==(const struct profile &p) const
         {
@@ -71,8 +139,7 @@ public:
                    num_channels == p.num_channels &&
                    mel_filters == p.mel_filters &&
                    mel_high_freq == p.mel_high_freq &&
-                   mel_power_threshold == p.mel_power_threshold &&
-                   dct_length == p.dct_length;
+                   mel_power_threshold == p.mel_power_threshold;
         }
         
         inline bool operator!=(const profile &p) const {
@@ -88,7 +155,6 @@ public:
     fftw_complex *fft_in, *fft_out;
     fftw_plan fft_plan;
 
-    int dct_length;
     double *dct_in, *dct_out;
     fftw_plan dct_plan;
 
@@ -96,7 +162,7 @@ public:
     float *fft_freqs, *fft_power;
     float *mel_freqs, *mel_power;
     float *dct_coeffs;
-
+    float *wvl_coeffs, *wvl_aux;
 
     mfcc(const struct mfcc::profile &_p);
     ~mfcc();
@@ -127,8 +193,10 @@ mfcc::mfcc(const struct mfcc::profile &_p)
     mel_freqs = (float *)malloc(sizeof(float) * (p.mel_filters+2));
     mel_power = (float *)malloc(sizeof(float) * p.mel_filters);
    
-    dct_length = p.mel_filters / 2; 
-    dct_coeffs = (float *)malloc(sizeof(float) * dct_length);
+    dct_coeffs = (float *)malloc(sizeof(float) * p.mel_filters);
+    
+    wvl_coeffs = (float *)malloc(sizeof(float) * p.mel_filters);
+    wvl_aux = (float *)malloc(sizeof(float) * (p.mel_filters + WAVELET_BORDER));
 
     /* Hann's window */
     for(int i=0; i<p.frame_length; i++)
@@ -145,6 +213,9 @@ mfcc::mfcc(const struct mfcc::profile &_p)
 
 mfcc::~mfcc()
 {
+    free(wvl_aux);
+    free(wvl_coeffs);
+
     free(dct_coeffs);
 
     free(mel_power);
@@ -211,8 +282,38 @@ void mfcc::process_frame(const sample_t *samples)
         fft_power[i] = power_to_db(fft_power[i]);
 
     fftw_execute(dct_plan);
-    for(int i=0; i<dct_length; i++)
-        dct_coeffs[i] = (float)(dct_out[i] / (2*p.mel_filters));
+    for(int i=0; i<p.mel_filters; i++)
+        dct_coeffs[i] = dct_out[i] / (2*p.mel_filters);
+
+    memcpy(wvl_coeffs, mel_power, sizeof(float)*p.mel_filters);
+    wavelet_forward(wvl_coeffs, wvl_aux, p.mel_filters);
+}
+
+/* ------------------------------------------------------------------------- */
+
+struct lookahead
+{
+    char data[8];
+    int size;
+
+    lookahead(int fd);
+
+    inline bool match(const char *pat) const {
+        return match(pat, strlen(pat));
+    }
+    inline bool match(const char *pat, int n) const {
+        return size >= n && 0 == memcmp(data, pat, n);
+    }
+};
+
+lookahead::lookahead(int fd) 
+{
+    ssize_t rc = read(fd, data, sizeof(data));
+    if(-1 == rc) {
+        perror("read");
+        exit(EXIT_FAILURE);
+    }
+    size = rc;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -227,13 +328,12 @@ protected:
 
     streamer(int _fd, int buffer_size);
     void need_buffer_space(int frame_bytes);
+    void check_format();
 
 public:
     enum read_status {
         READ_OK, READ_STALL, READ_EOF
     };
-
-    static class streamer *init(int fd, int buffer_size);
 
     virtual ~streamer() = 0;
     virtual enum read_status read(int samples) = 0;
@@ -257,8 +357,8 @@ class wav_streamer : public streamer
 protected:
     int fd_flags;
 
-    void parse_wav(char *lookahead, size_t lookahead_size);
-    void assume_raw(char *lookahead, size_t lookahead_size);
+    void parse_wav(const struct lookahead &la);
+    void assume_raw(const struct lookahead &la);
     void set_blocking(bool blocking);
 
     struct wavhdr {
@@ -280,7 +380,7 @@ protected:
     };
 
 public:
-    wav_streamer(int _fd, int buffer_size, char *lookahead, size_t lookahead_size);
+    wav_streamer(int _fd, int buffer_size, const struct lookahead &la);
     virtual ~wav_streamer();
     virtual enum read_status read(int samples);
     virtual void shutdown();
@@ -290,12 +390,13 @@ class vorbis_streamer : public streamer
 {
 protected:
     static size_t read_callback(void *ptr, size_t size, size_t nmemb, void *datasource);
+    static int close_callback(void *datasource);
 
     OggVorbis_File vf;
     bool vf_valid;
 
 public:
-    vorbis_streamer(int _fd, int buffer_size, char *lookahead, size_t lookahead_size);
+    vorbis_streamer(int _fd, int buffer_size, const struct lookahead &la);
     virtual ~vorbis_streamer();
     virtual enum read_status read(int samples);
     virtual void shutdown();
@@ -317,44 +418,28 @@ streamer::~streamer()
     free(buf);
 }
 
-class streamer* streamer::init(int fd, int buffer_size)
+void streamer::check_format()
 {
-    char lookahead[4];
-    int rc = ::read(fd, lookahead, sizeof(lookahead));
-    if(-1 == rc) {
-        perror("failed to recognize file format: read");
-        exit(EXIT_FAILURE);
-    }
-    if(sizeof(lookahead) != rc) {
-        fputs("file too short", stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    class streamer *ret;
-    if(0 == memcmp(lookahead, "OggS", 4))
-        ret = new vorbis_streamer(fd, buffer_size, lookahead, sizeof(lookahead));
-    else
-        ret = new wav_streamer(fd, buffer_size, lookahead, sizeof(lookahead));
-
-    if(1 != ret->num_channels && 2 != ret->num_channels) {
+    if(1 != num_channels && 2 != num_channels) {
         fputs("only mono or stereo streams are supported", stderr);
         exit(EXIT_FAILURE);
     }
-    if(16 != ret->bits_per_sample) {
+    if(16 != bits_per_sample) {
         fputs("only 16 bits per sample streams are supported", stderr);
         exit(EXIT_FAILURE);
     }
-
-    return ret;
 }
 
 void streamer::need_buffer_space(int frame_bytes)
 {
     if(endptr - rdptr < frame_bytes)
     {
-        memmove(buf, rdptr, wrptr - rdptr);
-        wrptr = buf + (wrptr - rdptr);
-        rdptr = buf;
+        char *low  = rdptr < wrptr ? rdptr : wrptr,
+             *high = rdptr > wrptr ? rdptr : wrptr;
+
+        memmove(buf, rdptr, high-rdptr);
+        wrptr -= low - buf;
+        rdptr -= low - buf;
     }
 }
 
@@ -368,18 +453,18 @@ void streamer::make_profile(struct mfcc::profile *profile) const
     profile->mel_filters = config.mel_filters;
     profile->mel_high_freq = config.mel_high_freq;
     profile->mel_power_threshold = config.mel_power_threshold;
-    profile->dct_length = config.dct_length;
 }
 
 /* -------------------------------------------------------------------------- */
 
-wav_streamer::wav_streamer(int _fd, int buffer_size, char *lookahead, size_t lookahead_size)
+wav_streamer::wav_streamer(int _fd, int buffer_size, const struct lookahead &la)
                     : streamer(_fd, buffer_size)
 {
-    if(0 == memcmp(lookahead, "RIFF", 4))
-        parse_wav(lookahead, lookahead_size);
+    if(la.match("RIFF"))
+        parse_wav(la);
     else
-        assume_raw(lookahead, lookahead_size);
+        assume_raw(la);
+    check_format();
 
     set_blocking(false);
 }
@@ -387,16 +472,17 @@ wav_streamer::~wav_streamer() {
     shutdown();
 }
 
-void wav_streamer::parse_wav(char *lookahead, size_t lookahead_size)
+void wav_streamer::parse_wav(const struct lookahead &la)
 {
     struct wavhdr hdr;
 
-    memcpy(&hdr, lookahead, lookahead_size);
+    memcpy(&hdr, la.data, la.size);
 
-    ssize_t remaining = sizeof(hdr) - lookahead_size;
+    ssize_t remaining = sizeof(hdr) - la.size;
+    char *hptr = (char *)&hdr + la.size;
     while(remaining > 0)
     {
-        ssize_t rc = ::read(fd, (char *)&hdr + lookahead_size, remaining);
+        ssize_t rc = ::read(fd, hptr, remaining);
         if(-1 == rc) {
             perror("read");
             exit(EXIT_FAILURE);
@@ -406,6 +492,7 @@ void wav_streamer::parse_wav(char *lookahead, size_t lookahead_size)
             exit(EXIT_FAILURE);
         }
         remaining -= rc;
+        hptr += rc;
     }
 
     if(0 != memcmp(hdr.riff_format, "WAVE", 4) ||
@@ -421,14 +508,14 @@ void wav_streamer::parse_wav(char *lookahead, size_t lookahead_size)
     bits_per_sample = hdr.bits_per_sample;
 }
 
-void wav_streamer::assume_raw(char *lookahead, size_t lookahead_size)
+void wav_streamer::assume_raw(const struct lookahead &la)
 {
     num_channels = 1;
     sample_rate = 16000;
     bits_per_sample = 16;
 
-    memcpy(wrptr, lookahead, lookahead_size);
-    wrptr += lookahead_size;
+    memcpy(wrptr, la.data, la.size);
+    wrptr += la.size;
 }
 
 void wav_streamer::set_blocking(bool blocking)
@@ -448,7 +535,7 @@ void wav_streamer::set_blocking(bool blocking)
 }
 
 void wav_streamer::shutdown() {
-    set_blocking(true);
+    close(fd);
 }
 
 enum streamer::read_status wav_streamer::read(int samples)
@@ -487,12 +574,14 @@ enum streamer::read_status wav_streamer::read(int samples)
 
 /* -------------------------------------------------------------------------- */
 
-vorbis_streamer::vorbis_streamer(int _fd, int buffer_size, char *lookahead, size_t lookahead_size)
+vorbis_streamer::vorbis_streamer(int _fd, int buffer_size, const struct lookahead &la)
                     : streamer(_fd, buffer_size)
 {
-    ov_callbacks callbacks = { .read_func = &read_callback };
+    ov_callbacks callbacks = { };
+    callbacks.read_func = &read_callback;
+    callbacks.close_func = &close_callback;
 
-    int rc = ov_open_callbacks(this, &vf, lookahead, lookahead_size, callbacks);
+    int rc = ov_open_callbacks(this, &vf, la.data, la.size, callbacks);
     if(0 != rc) {
         fprintf(stderr, "failed to open ogg file: ov_open_callbacks: %d\n", rc);
         exit(EXIT_FAILURE);
@@ -504,6 +593,7 @@ vorbis_streamer::vorbis_streamer(int _fd, int buffer_size, char *lookahead, size
     sample_rate = info->rate;
     bits_per_sample = 16;
 
+    check_format();
 }
 vorbis_streamer::~vorbis_streamer() {
     shutdown();
@@ -524,12 +614,16 @@ size_t vorbis_streamer::read_callback(void *ptr, size_t size, size_t nmemb, void
     return toread / size;
 }
 
+int vorbis_streamer::close_callback(void *datasource) {
+    close( ((class vorbis_streamer *)datasource)->fd );
+    return 0;
+}
+
 void vorbis_streamer::shutdown() {
     if(!vf_valid)
         return;
     ov_clear(&vf);
     vf_valid = false;
-    
 }
 
 enum streamer::read_status vorbis_streamer::read(int samples)
@@ -565,6 +659,7 @@ enum streamer::read_status vorbis_streamer::read(int samples)
 class outstream
 {
     FILE *fp;
+    bool fft;
 
     inline FILE *get_fp() {
         if(NULL == fp)
@@ -599,7 +694,7 @@ public:
         fflush(get_fp());
     }
 
-    void write_profile(const mfcc &mfcc);
+    void write_profile(const mfcc &mfcc, bool _fft);
     void write_group_hdr(const char *filename, const char *label, int sample_offset);
     void write_frame(const mfcc &mfcc);
 };
@@ -608,23 +703,26 @@ static outstream out;
 
 outstream::outstream() {
     fp = NULL;
+    fft = true;
 }
 outstream::outstream(FILE *_fp) {
     fp = _fp;
+    fft = true;
 }
-void outstream::write_profile(const mfcc &mfcc)
+void outstream::write_profile(const mfcc &mfcc, bool _fft)
 {
+    fft = _fft;
+
     out_byte(PACKET_PROFILE);
 
+    out_byte(mfcc.p.mel_filters);
+    out_short(fft ? mfcc.fft_length : 0);
     out_short(mfcc.p.frame_length);
     out_short(mfcc.p.frame_spacing);
     out_short(mfcc.p.sample_rate);
-    out_byte(mfcc.p.mel_filters);
-    out_byte(mfcc.dct_length);
-    out_short(mfcc.fft_length);
 
     out_buf(mfcc.mel_freqs, sizeof(float)*mfcc.p.mel_filters);
-    out_buf(mfcc.fft_freqs, sizeof(float)*mfcc.fft_length);
+    if(fft) out_buf(mfcc.fft_freqs, sizeof(float)*mfcc.fft_length);
 }
 void outstream::write_group_hdr(const char *filename, const char *label, int sample_offset)
 {
@@ -645,348 +743,396 @@ void outstream::write_frame(const mfcc &mfcc)
     out_byte(PACKET_FRAME);
 
     out_buf(mfcc.mel_power,  sizeof(float)*mfcc.p.mel_filters);
-    out_buf(mfcc.fft_power,  sizeof(float)*mfcc.fft_length);
-    out_buf(mfcc.dct_coeffs, sizeof(float)*mfcc.dct_length);
+    if(fft) out_buf(mfcc.fft_power,  sizeof(float)*mfcc.fft_length);
+    out_buf(mfcc.dct_coeffs, sizeof(float)*mfcc.p.mel_filters);
+    out_buf(mfcc.wvl_coeffs, sizeof(float)*mfcc.p.mel_filters);
 }
 
 /* -------------------------------------------------------------------------- */
 
-static int sub_pipe(int argc, char *argv[])
+static void get_fd_filename(int fd, char *buf, int bufsize)
 {
-    class streamer *streamer = streamer::init(STDIN_FILENO, config.streamer_buffer);
+    char procfspath[32];
+    sprintf(procfspath, "/proc/self/fd/%d", fd);
 
-    struct mfcc::profile profile;
-    streamer->make_profile(&profile);
-
-    class mfcc mfcc(profile);
-
-    {
-        char buf[512], *ptr = buf;
-
-        ptr += sprintf(ptr,
-                "sample rate %d Hz; frame length: %d samples, frame spacing: %d samples\n"
-                "%d mel filters:",
-                profile.sample_rate, profile.frame_length, profile.frame_spacing, profile.mel_filters);
-
-        for(int i=0; i<profile.mel_filters+2; i++)
-            ptr += sprintf(ptr, " %.1f Hz", mfcc.mel_freqs[i]);
-        ptr += sprintf(ptr, "\n%d dct coefficients\n", mfcc.dct_length);
-
-        fputs(buf, stderr);
+    ssize_t len = readlink(procfspath, buf, bufsize);
+    if(-1 == len) {
+        perror("failed to resolve fd to pathname: readlink");
+        exit(EXIT_FAILURE);
     }
-
-    out.write_profile(mfcc);
-    out.write_group_hdr("pipe", "?", 0);
-
-    int frame_count = 0;
-    for(;;)
-    {
-        enum streamer::read_status rc = streamer->read(profile.frame_length);
-        if(rc == streamer::READ_EOF)
-            break;
-        if(rc == streamer::READ_STALL)
-            out.flush();
-        else {
-            mfcc.process_frame(streamer->get_samples());
-            streamer->advance(profile.frame_spacing);
-
-            out.write_frame(mfcc);
-            frame_count += 1;
-        }
+    if(len >= bufsize) {
+        fputs("real path of fd too long", stderr);
+        exit(EXIT_FAILURE);
     }
-
-    out.flush();
-
-    fprintf(stderr, "processed %d frames\n", frame_count);
-
-    delete streamer;
-
-    return 0;
+    buf[len] = '\0';
 }
 
-/* -------------------------------------------------------------------------- */
-
-class mlf_parser
+class label_source
 {
+protected:
+    inline label_source() { }
+
 public:
-    enum line_type {
-        FILE_START, LABEL, FILE_END, NO_LINE
+    struct source {
+        class streamer *streamer;
+        char name[256];
     };
 
-private:
-    FILE *fp;
-    char buffer[128];
+    struct label {
+        char name[32];
+        long long start;
+        long long end;
+    };
 
-    enum line_type type;
-    const char *filename;
-    long long label_start;
-    long long label_end;
-    const char *label_value;
+    virtual ~label_source();
 
-    inline void read_line() {
-        buffer[0] = '\0';
-        fgets(buffer, sizeof(buffer), fp);
-    }
-
-public:
-    mlf_parser(const char *mlffile);
-    ~mlf_parser();
-
-    bool next_line();
-    inline enum line_type get_line_type() const { return type; }
-    inline const char* get_filename() const { return filename; }
-    inline long long get_label_start() const { return label_start; }
-    inline long long get_label_end() const { return label_end; }
-    inline const char *get_label_value() const { return label_value; }
+    virtual bool next_source(struct source *src) = 0;
+    virtual bool next_label(struct label *lbl) = 0;
 };
 
-mlf_parser::mlf_parser(const char *mlffile)
+label_source::~label_source() {
+}
+
+class simple_label_source : public label_source
 {
-    fp = fopen(mlffile, "r");
+    int fd;
+    struct lookahead la;
+    char name_hint[256];
+    bool got_name_hint;
+    bool has_source, has_label;
+
+public:
+    simple_label_source(int _fd, const struct lookahead &_la, const char *_name_hint);
+    virtual ~simple_label_source();
+
+    virtual bool next_source(struct source *src);
+    virtual bool next_label(struct label *lbl);
+};
+
+class mlf_label_source : public label_source
+{
+    FILE *fp;
+    char buffer[256], basedir[256], filename[256];
+    bool has_line;
+
+    bool get_line();
+
+public:
+    mlf_label_source(int _fd, const struct lookahead &_la);
+    virtual ~mlf_label_source();
+
+    virtual bool next_source(struct source *src);
+    virtual bool next_label(struct label *lbl);
+};
+
+class args_label_source : public label_source
+{
+    int argc;
+    char** argv;
+    int argidx;
+
+    class label_source *child;
+
+public:
+    args_label_source(int _argc, char **_argv);
+    virtual ~args_label_source();
+
+    virtual bool next_source(struct source *src);
+    virtual bool next_label(struct label *lbl);
+};
+
+
+simple_label_source::simple_label_source(int _fd, const struct lookahead &_la, const char *_name_hint)
+        : fd(_fd), la(_la), has_source(true), has_label(true)
+{
+    got_name_hint = (NULL != _name_hint);
+    if(got_name_hint)
+        strcpy(name_hint, _name_hint);
+}
+simple_label_source::~simple_label_source() {
+    if(-1 != fd)
+        close(fd);
+}
+
+bool simple_label_source::next_source(struct source *src)
+{
+    if(!has_source)
+        return false;
+
+    if(got_name_hint)
+        strcpy(src->name, name_hint);
+    else
+        get_fd_filename(fd, src->name, sizeof(src->name));
+
+    if(la.size >= 4 && 0 == memcmp(la.data, "OggS", 4))
+        src->streamer = new vorbis_streamer(fd, config.streamer_buffer, la);
+    else
+        src->streamer = new wav_streamer(fd, config.streamer_buffer, la);
+
+    fd = -1;
+    has_source = false;
+    return true;
+}
+
+bool simple_label_source::next_label(struct label *lbl)
+{
+    if(has_source || !has_label)
+        return false;
+
+    strcpy(lbl->name, "?");
+    lbl->start = 0ll;
+    lbl->end = 0x7fffffffffffffffll;
+
+    has_label = false;
+    return true;
+}
+
+
+mlf_label_source::mlf_label_source(int _fd, const struct lookahead &_la)
+{
+    get_fd_filename(_fd, basedir, sizeof(basedir));
+    if(basedir[0] != '/')
+        basedir[0] = '\0';
+    else
+        strrchr(basedir, '/')[1] = '\0';
+
+    fp = fdopen(_fd, "r");
     if(NULL == fp) {
-        perror("failed to open mlf file: fopen");
-        exit(EXIT_FAILURE);
-    }
-
-    read_line();
-
-    if(0 != memcmp("#!MLF!#", buffer, 7)) {
-        fputs("mlf signature missing", stderr);
+        perror("fdopen");
         exit(EXIT_FAILURE);
     }
 }
-mlf_parser::~mlf_parser() {
+
+mlf_label_source::~mlf_label_source() {
     fclose(fp);
 }
 
-bool mlf_parser::next_line()
+bool mlf_label_source::get_line()
 {
-    do 
-        read_line();
-    while('\n' == buffer[0] || '\r' == buffer[0]);
-
-    if('\0' == buffer[0]) {
-        type = mlf_parser::NO_LINE;
-        filename = label_value = NULL;
-        label_start = label_end = 0LL;
-        return false;
-    }
-
-    if('.' == buffer[0]) {
-        type = mlf_parser::FILE_END;
-        filename = label_value = NULL;
-        label_start = label_end = 0LL;
+    if(has_line)
         return true;
-    }
-    if('"' == buffer[0]) {
-        type = mlf_parser::FILE_START;
-        
-        filename = buffer+3;
-        *strchrnul(buffer, '.') = '\0';
-        
-        label_value = NULL;
-        label_start = label_end = 0LL;
-        return true;
-    }
-    {
-        type = mlf_parser::LABEL;
-        filename = NULL;
-
-        const char *delim = " \n\t\r";
-        char *saveptr, *p;
-        p = strtok_r(buffer, delim, &saveptr);
-        label_start = strtoll(p, NULL, 10);
-
-        p = strtok_r(NULL, delim, &saveptr);
-        label_end = strtoll(p, NULL, 10);
-
-        p = strtok_r(NULL, delim, &saveptr);
-        label_value = p;
-        return true;
-    }
-}
-
-class sub_corpora
-{
-    char basedir[128];
-    char path[128];
-
-    int fd;
-    class streamer *streamer;
-    class mfcc *mfcc;
-    struct mfcc::profile profile;
-
-    sub_corpora();
-    ~sub_corpora();
-
-    void drop_streamer();
-    void drop_mfcc();
-
-    int run(int argc, char *argv[]);
-
-    void open_file(const char *filename);
-    void process_slice(long long label_start, long long label_end, const char *label_value);
-
-public:
-    static inline int main(int argc, char *argv[]) {
-        return sub_corpora().run(argc, argv);
-    }
-};
-
-sub_corpora::sub_corpora() {
-    fd = -1;
-    streamer = NULL;
-    mfcc = NULL;
-}
-sub_corpora::~sub_corpora() {
-    drop_streamer();
-    drop_mfcc();
-}
-
-void sub_corpora::drop_streamer() {
-    if(-1 != fd) {
-        close(fd);
-        fd = -1;
-    }
-    if(NULL != streamer) {
-        delete streamer;
-        streamer = NULL;
-    }
-}
-void sub_corpora::drop_mfcc() {
-    if(NULL != mfcc) {
-        delete mfcc;
-        mfcc = NULL;
-    }
-}
-
-int sub_corpora::run(int argc, char *argv[])
-{
-    if(argc != 3) {
-        fputs("USAGE: mfcc corpora [mlf file]\n", stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    {
-        strcpy(basedir, argv[2]);
-        char *slash = strrchr(basedir, '/');
-        if(NULL != slash)
-            slash[1] = '\0';
-        else
-            basedir[0] = '\0';
-
-        fprintf(stderr, "opening MLF file %s; base directory: %s\n", argv[2], basedir);
-    }
-
-    mlf_parser mlf(argv[2]);
-
-    while(mlf.next_line())
-        switch(mlf.get_line_type()) {
-            case mlf_parser::FILE_START:
-                open_file(mlf.get_filename());
-                break;
-            case mlf_parser::FILE_END:
-                drop_streamer();
-                break;
-             case mlf_parser::LABEL:
-                process_slice(mlf.get_label_start(), mlf.get_label_end(), mlf.get_label_value());
-                break;
-            default:
-                break;
+    do {
+        if(NULL == fgets(buffer, sizeof(buffer), fp))
+        {
+            if(feof(fp))
+                return false;
+            perror("fgets");
+            exit(EXIT_FAILURE);
         }
+    } while(buffer[0] == '\n' || buffer[0] == '\r');
+    has_line = true;
+    return true;
 
-    return 0;
 }
 
-void sub_corpora::open_file(const char *filename)
+bool mlf_label_source::next_source(struct source *src)
 {
-    drop_streamer();
-
-    sprintf(path, "%s%s.ogg", basedir, filename);
-    fprintf(stderr, "opening file %s\n", path);
-
-    fd = open(path, O_RDONLY);
-    if(-1 == fd) {
-        perror("open");
-        exit(EXIT_FAILURE);
-    }
-
-    streamer = streamer::init(fd, config.streamer_buffer);
-
-    struct mfcc::profile new_profile;
-    streamer->make_profile(&new_profile);
-
-    if(NULL == mfcc || new_profile != profile)
+    while(get_line())
     {
-        fputs("creating new mfcc profile...\n", stderr);
-        profile = new_profile;
-
-        drop_mfcc();
-        mfcc = new class mfcc(profile);
-
-        out.write_profile(*mfcc);
-    }
-}
-
-void sub_corpora::process_slice(long long label_start, long long label_end, const char *label_value)
-{
-    if(label_start == label_end)
-        return;
-
-    float lbl_start = label_start * 1e-7f,
-          lbl_end = label_end * 1e-7f;
-
-    float frame_duration = (float)profile.frame_length / profile.sample_rate;
-
-    bool need_header = true;
-
-    for(;;)
-    {
-        enum streamer::read_status rc = streamer->read(profile.frame_length);
-        if(rc == streamer::READ_EOF)
-            break;
-
-        int sample_offset = streamer->get_sample_offset();
-        float time_offset = (float)sample_offset / profile.sample_rate;
-        
-        if(time_offset + frame_duration <= lbl_start) {
-            streamer->advance(profile.frame_spacing);
+        if('.' == buffer[0]) {
+            has_line = false;
             continue;
         }
 
-        if(time_offset >= lbl_end)
-            break;
+        if('"' == buffer[0])
+        {
+            char *f = buffer+3,
+                 *e = strchr(f, '.');
+            strcpy(e, ".ogg");
+            strcpy(src->name, basedir);
+            strcat(src->name, f);
 
-        if(need_header) {
-            out.write_group_hdr(path, label_value, sample_offset);
-            need_header = false;
+            int fd = open(src->name, O_RDONLY);
+            if(-1 == fd) {
+                perror("open");
+                exit(EXIT_FAILURE);
+            }
+
+            has_line = false;
+
+            simple_label_source s(fd, lookahead(fd), f);
+            return s.next_source(src);
         }
 
-        mfcc->process_frame(streamer->get_samples());
-        streamer->advance(profile.frame_spacing);
-        out.write_frame(*mfcc);
+        has_line = false;
     }
 
-    if(need_header)
-        fprintf(stderr, "warning: label %s (range %lld -- %lld) in file %s did not hit any frame\n", 
-                label_value, label_start, label_end, path);
+    return false;
+}
+
+bool mlf_label_source::next_label(struct label *lbl)
+{
+    while(get_line())
+    {
+        if('.' == buffer[0]) {
+            has_line = false;
+            continue;
+        }
+
+        if('"' == buffer[0])
+            break;
+
+        sscanf(buffer, "%lld %lld %s", &lbl->start, &lbl->end, lbl->name);
+        has_line = false;
+        return true;
+    }
+
+    return false;
+}
+
+args_label_source::args_label_source(int _argc, char **_argv)
+        : argc(_argc), argv(_argv), argidx(0), child(NULL) { }
+args_label_source::~args_label_source() {
+    if(NULL != child)
+        delete child;
+}
+
+bool args_label_source::next_source(struct source *src)
+{
+    if(NULL != child) {
+        if(child->next_source(src))
+            return true;
+        delete child;
+        child = NULL;
+    }
+    
+    if(argidx >= argc)
+        return false;
+
+    int fd;
+    const char *name_hint;
+    
+    if(0 == strcmp("-", argv[argidx])) {
+        fd = STDIN_FILENO;
+        name_hint = NULL;
+    } else {
+        fd = open(argv[argidx], O_RDONLY);
+        if(-1 == fd) {
+            perror("open");
+            exit(EXIT_FAILURE);
+        }
+        name_hint = argv[argidx];
+    }
+    
+    struct lookahead la(fd);
+
+    if(la.match("#!MLF!#"))
+        child = new mlf_label_source(fd, la);
+    else
+        child = new simple_label_source(fd, la, name_hint);
+
+    argidx += 1;
+
+    return next_source(src);
+}
+
+bool args_label_source::next_label(struct label *lbl) {
+    return NULL != child && child->next_label(lbl);
+}
+
+/* -------------------------------------------------------------------------- */
+
+static void convert(int argc, char *argv[])
+{
+    argc -= 1; argv += 1;
+
+    bool write_fft = true;
+    if(argc >= 1 && 0 == strcmp(argv[0], "--no-fft")) {
+        write_fft = false;
+        argc -= 1; argv += 1;
+    }
+
+    args_label_source lblsrc(argc, argv);
+
+    struct label_source::source src;
+    struct label_source::label lbl;
+    struct mfcc::profile profile;
+    class mfcc *mfcc = NULL;
+
+    while(lblsrc.next_source(&src))
+    {
+        fprintf(stderr, "processing file %s\n", src.name);
+
+        struct mfcc::profile new_profile;
+        src.streamer->make_profile(&new_profile);
+        
+        if(NULL == mfcc || new_profile != profile)
+        {
+            profile = new_profile;
+
+            if(NULL != mfcc)
+                delete mfcc;
+            mfcc = new class mfcc(profile);
+
+            out.write_profile(*mfcc, write_fft);
+
+            char buf[512], *ptr = buf;
+            ptr += sprintf(ptr,
+                    "profile: sample rate %d Hz; frame length: %d samples, frame spacing: %d samples\n"
+                    "%d mel filters:",
+                    profile.sample_rate, profile.frame_length, profile.frame_spacing, profile.mel_filters);
+            for(int i=0; i<profile.mel_filters+2; i++)
+                ptr += sprintf(ptr, " %.1f Hz", mfcc->mel_freqs[i]);
+            ptr += sprintf(ptr, "\n");
+            fputs(buf, stderr);
+        }
+
+        float frame_duration = (float)profile.frame_length / profile.sample_rate;
+
+        while(lblsrc.next_label(&lbl))
+        {
+            if(lbl.start == lbl.end)
+                continue;
+
+            bool need_header = true;
+            float lbl_start = lbl.start * 1e-7f,
+                  lbl_end = lbl.end * 1e-7f;
+
+            for(;;)
+            {
+                enum streamer::read_status rc = src.streamer->read(profile.frame_length);
+                if(rc == streamer::READ_EOF)
+                    break;
+                if(rc == streamer::READ_STALL) {
+                    out.flush();
+                    continue;
+                }
+
+                int sample_offset = src.streamer->get_sample_offset();
+                float time_offset = (float)sample_offset / profile.sample_rate;
+                
+                if(time_offset + frame_duration <= lbl_start) {
+                    src.streamer->advance(profile.frame_spacing);
+                    continue;
+                }
+
+                if(time_offset >= lbl_end)
+                    break;
+
+                if(need_header) {
+                    out.write_group_hdr(src.name, lbl.name, sample_offset);
+                    need_header = false;
+                }
+
+                mfcc->process_frame(src.streamer->get_samples());
+                src.streamer->advance(profile.frame_spacing);
+                out.write_frame(*mfcc);
+            }
+
+            if(need_header)
+                fprintf(stderr, "warning: label %s (range %lld -- %lld) in file %s did not hit any frame\n", 
+                lbl.name, lbl.start, lbl.end, src.name);
+        }
+
+        delete src.streamer;
+    }
 }
 
 /* -------------------------------------------------------------------------- */
 
 int main(int argc, char *argv[])
 {
-    if(argc < 2) {
-        fputs("USAGE: mfcc [subprogram] [options...]\n", stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    if(strcmp(argv[1], "pipe") == 0)
-        return sub_pipe(argc, argv);
-    if(strcmp(argv[1], "corpora") == 0)
-        return sub_corpora::main(argc, argv);
-
-    fputs("unknown subprogram; available: pipe, corpora\n", stderr);
-    exit(EXIT_FAILURE);
+    convert(argc, argv);
+    return EXIT_SUCCESS;
 }
 

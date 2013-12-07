@@ -6,12 +6,11 @@ class MFCCReader(object):
     ProfilePacket = collections.namedtuple('ProfilePacket', 
         ('seq',
          'frame_length', 'frame_spacing', 'sample_rate',
-         'mel_filters', 'dct_length', 'fft_length',
-         'mel_freqs', 'fft_freqs'))
+         'mel_filters', 'fft_length', 'mel_freqs', 'fft_freqs'))
     GroupHeaderPacket = collections.namedtuple('GroupHeaderPacket', 
         ('seq', 'profile', 'filename', 'label', 'sample_offset'))
     FramePacket = collections.namedtuple('FramePacket', 
-        ('seq', 'group_header', 'mel_powers', 'fft_powers', 'dct_coeffs', 'sample_offset'))
+        ('seq', 'group_header', 'mel_powers', 'fft_powers', 'dct_coeffs', 'wvl_coeffs', 'sample_offset'))
 
     PROFILE_PACKET_ID = 1
     GROUP_HEADER_PACKET_ID = 2
@@ -47,8 +46,9 @@ class MFCCReader(object):
         (packet_id,) = struct.unpack('=b', packet_id)
 
         if MFCCReader.PROFILE_PACKET_ID == packet_id:
-            frame_length, frame_spacing, sample_rate, \
-            mel_filters, dct_length, fft_length = self._read_fmt('=hhhbbh')
+            mel_filters, fft_length, \
+            frame_length, frame_spacing, sample_rate = self._read_fmt('=bhhhh')
+
             x = self._read_fmt('=%df' % (mel_filters + fft_length))
 
             self._profile_seq += 1
@@ -58,7 +58,6 @@ class MFCCReader(object):
                 frame_spacing = frame_spacing,
                 sample_rate = sample_rate,
                 mel_filters = mel_filters,
-                dct_length = dct_length,
                 fft_length = fft_length, 
                 mel_freqs = x[:mel_filters],
                 fft_freqs = x[mel_filters:]
@@ -82,11 +81,12 @@ class MFCCReader(object):
 
         if MFCCReader.FRAME_PACKET_ID == packet_id:
             profile = self.current_profile
-            x = self._read_fmt('=%df' % (profile.mel_filters + profile.fft_length + profile.dct_length))
+            x = self._read_fmt('=%df' % (3*profile.mel_filters + profile.fft_length))
             x = iter(x)
             mel_powers = list(itertools.islice(x, profile.mel_filters))
             fft_powers = list(itertools.islice(x, profile.fft_length))
-            dct_coeffs = list(itertools.islice(x, profile.dct_length))
+            dct_coeffs = list(itertools.islice(x, profile.mel_filters))
+            wvl_coeffs = list(itertools.islice(x, profile.mel_filters))
 
             self._frame_seq += 1
             frame = MFCCReader.FramePacket(
@@ -95,6 +95,7 @@ class MFCCReader(object):
                 mel_powers = mel_powers,
                 fft_powers = fft_powers,
                 dct_coeffs = dct_coeffs,
+                wvl_coeffs = wvl_coeffs,
                 sample_offset = self._sample_offset
             )
             self._sample_offset += self.current_profile.frame_spacing
