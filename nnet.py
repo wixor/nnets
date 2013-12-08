@@ -31,9 +31,9 @@ def nnet(Warray, X,Y, justAnswer=False):
 
     L0 = X
     A1 = W * prepend_ones(L0)
-    if justAnswer:
-        return A1
     C = softmax(A1)
+    if justAnswer:
+        return C
     LOSS, dLOSS_dA1 = softmax_crossentropy(C, Y)
     #dLOSS_dL0 = (W.T * dLOSS_dA1)[1:,] # strip derivative wrt. constant bias
 
@@ -89,7 +89,7 @@ def recognize():
 
     for packet in reader:
         if isinstance(packet, GroupHeaderPacket):
-            print '\n\n# file %s, label %s, offset %d' % (packet.filename, packet.label, packet.sample_offset)
+            print '\n\n# label %s (file %s, offset %d)' % (packet.label, packet.filename, packet.sample_offset)
             print ' '.join(lblnames)
             continue
 
@@ -104,7 +104,7 @@ def recognize():
         )
         X, Y = makeXY(dataset)
 
-        C = nnet(W, X, Y, justAnswer=True)
+        C = nnet(W, X, Y, justAnswer=True) * np.exp(packet.dct_coeffs[0]*0.23025851)
         C = [ str(float(C[i])) for i in xrange(C.shape[0]) ]
         print ' '.join(C)
 
