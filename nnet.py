@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!./python
 import sys
 import cPickle as pickle
 import numpy as np
@@ -84,13 +84,13 @@ def recognize():
 
     with open(sys.argv[4], 'rb') as f:
         W = pickle.load(f)
-        lblnames = W['lblnames']
+        labelnames = W['labelnames']
         W = W['weights']
 
     for packet in reader:
         if isinstance(packet, GroupHeaderPacket):
             print '\n\n# label %s (file %s, offset %d)' % (packet.label, packet.filename, packet.sample_offset)
-            print ' '.join(lblnames)
+            print '\t'.join(labelnames)
             continue
 
         if not isinstance(packet, FramePacket):
@@ -100,13 +100,13 @@ def recognize():
             mels = np.matrix(packet.mel_powers).T,
             dcts = np.matrix(packet.dct_coeffs).T,
             wvls = np.matrix(packet.wvl_coeffs).T,
-            labels = np.matrix(np.zeros( (6,1) ))
+            labels = np.matrix(np.zeros( (7,1) ))
         )
         X, Y = makeXY(dataset)
 
-        C = nnet(W, X, Y, justAnswer=True) * np.exp(packet.dct_coeffs[0]*0.23025851)
+        C = nnet(W, X, Y, justAnswer=True) 
         C = [ str(float(C[i])) for i in xrange(C.shape[0]) ]
-        print ' '.join(C)
+        print '\t'.join(C)
 
 def test():
     if len(sys.argv) != 5:
@@ -156,14 +156,18 @@ def learn():
     X, Y = makeXY(training)
 
     print ' ---- real training ---- '
-    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y))
+    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y), factr=1e10)
     print 'loss: %f' % value
     print 'weights:\n%r' % W
     print 'notes:\n%r' % info
     print
 
     with open(sys.argv[5], 'wb') as f:
-        pickle.dump(dict(weights = W, lblnames = training['lblnames']), f, -1)
+        pickle.dump(dict(
+            weights = W,
+            labelnames = training['labelnames'],
+            mode = sys.argv[2]),
+            f, -1)
     print 'dumped weights to %s' % sys.argv[5]
 
 def main():

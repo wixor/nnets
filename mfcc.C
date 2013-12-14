@@ -52,10 +52,11 @@ static inline float db_to_power(float p) {
 #define WAVELET_BORDER 6
 
 static inline float wavelet_predict(float a, float b, float c, float d) {
-    return (9.f * (a + b) - (c + d)) * 0.0625;
+    /* return (9.f * (a + b) - (c + d)) * 0.0625; */
+    return .5f * (a + b);
 }
 static inline float wavelet_update(float a, float b, float c, float d) {
-    return .5f * (a + b);
+    return .25f * (a + b);
 }
 
 static void wavelet_mirror(float *aux, int n)

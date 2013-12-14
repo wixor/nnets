@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!./python
 
 import sys, itertools
 import numpy as np
