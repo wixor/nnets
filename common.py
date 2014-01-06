@@ -1,6 +1,7 @@
-#!/usr/bin/python
+#!./python
 
-import itertools, collections, struct
+import sys, itertools, collections, struct
+import numpy as np
 
 ProfilePacket = collections.namedtuple('ProfilePacket', 
     ('seq',
@@ -47,9 +48,9 @@ class MFCCReader(object):
 
         if PROFILE_PACKET_ID == packet_id:
             mel_filters, fft_length, \
-            frame_length, frame_spacing, sample_rate = self._read_fmt('=bhhhh')
+            frame_length, frame_spacing, sample_rate = self._read_fmt('=bHHHH')
 
-            x = self._read_fmt('=%df' % (mel_filters + fft_length))
+            x = self._read_fmt('=%df' % (mel_filters+2 + fft_length))
 
             self._profile_seq += 1
             self.current_profile = ProfilePacket(
@@ -59,8 +60,8 @@ class MFCCReader(object):
                 sample_rate = sample_rate,
                 mel_filters = mel_filters,
                 fft_length = fft_length, 
-                mel_freqs = x[:mel_filters],
-                fft_freqs = x[mel_filters:]
+                mel_freqs = x[:mel_filters+2],
+                fft_freqs = x[mel_filters+2:]
             )
             return self.current_profile
 
@@ -174,7 +175,7 @@ class MFCCWriter(object):
 
     def _write_profile(self, packet):
         self._f.write(struct.pack(
-            '=bbhhhh%df' % (packet.mel_filters + packet.fft_length),
+            '=bbHHHH%df' % (packet.mel_filters+2 + packet.fft_length),
             PROFILE_PACKET_ID,
             packet.mel_filters, packet.fft_length,
             packet.frame_length, packet.frame_spacing, packet.sample_rate,
@@ -201,3 +202,21 @@ class MFCCWriter(object):
         if isinstance(packet, FramePacket):
             return self._write_frame(packet)
         raise TypeError('unsupported packet type ' + type(packet))
+
+def oread(filename):
+    return open(filename, 'rb') if filename != '-' else sys.stdin
+def owrite(filename):
+    return open(filename, 'wb') if filename != '-' else sys.stdout
+
+def xmaker(mode):
+    if 'mels' == mode:
+        def fn(f):
+            ret = np.array(f.mel_powers, dtype=np.float32)
+            return ret - np.average(ret)
+        return fn
+    if 'dcts' == mode:
+        return lambda f : np.array(f.dct_coeffs[1:11], dtype=np.float32)
+    if 'wvls' == mode:
+        return lambda f : np.array(f.wvl_coeffs[1:11], dtype=np.float32)
+    raise ValueError('unrecognized mode; must be mels, dcts or wvls')
+

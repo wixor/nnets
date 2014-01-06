@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!./python
 
 import sys, itertools
 from common import *
@@ -14,18 +14,15 @@ def main():
     out_file = open(sys.argv[2], 'wb') if sys.argv[2] != '-' else sys.stdout
     writer = MFCCWriter(out_file)
 
-    def framecmp(f1, f2):
-        x = cmp(f1.group_header.label, f2.group_header.label)
-        if 0 == x: x = cmp(f1.group_header.filename, f2.group_header.filename)
-        if 0 == x: x = f1.sample_offset - f2.sample_offset
-        return x
-
     profiles, group_headers, frames = reader.read_all()
-    frames.sort(cmp=framecmp)
+    frames.sort(key = lambda f: (f.group_header.label, f.group_header.filename, f.sample_offset))
 
     writer.write(profiles[0])
+    last_group_header = None
     for f in frames:
-        writer.write(f.group_header)
+        if f.group_header != last_group_header:
+            writer.write(f.group_header)
+            last_group_header = f.group_header
         writer.write(f)
 
 if __name__ == '__main__':

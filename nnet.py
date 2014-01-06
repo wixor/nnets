@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!./python
 import sys
 import cPickle as pickle
 import numpy as np
@@ -53,44 +53,48 @@ def run_classifier(X,Y,W):
 def check_classifier(X,Y,W):
     ans = run_classifier(X,Y,W)
 
-    errors = 0
+    histo = dict([ ((i,j),0) for i in xrange(Y.shape[0]) for j in xrange(Y.shape[0]) ])
+    errcnt = 0
+
     for i in xrange(Y.shape[1]):
         a = ans[i]
         corr = np.argmax(Y[:,i])
+        histo[(corr,a)] += 1
         if a != corr:
-            errors += 1
-    return errors, Y.shape[1]
+            errcnt += 1
+
+    return Y.shape[1], errcnt, histo
 
 ### ----------------------------------------------------------------------- ###
 
 def getXYmaker(mode):
     if 'dcts' == mode:
-        return lambda dataset: (dataset['dcts'][1:13, ], dataset['labels'])
+        return lambda dataset: (dataset['dcts'][1:9, ], dataset['labels'])
     if 'wvls' == mode:
-        return lambda dataset: (dataset['wvls'][1:13, ], dataset['labels'])
+        return lambda dataset: (dataset['wvls'][1:9, ], dataset['labels'])
     if 'mels' == mode:
-        return lambda dataset: (dataset['mels'][0:13, ], dataset['labels'])
+        return lambda dataset: (dataset['mels'], dataset['labels'])
     raise ValueError('unexpected mode: %s; must be dcts, wvls or mels' % mode)
 
 def recognize():
-    if len(sys.argv) != 5:
-        sys.stderr.write('USAGE: nnet.py recognize [dcts|wvls|mels] [mfcc file] [weights file]\n')
+    if len(sys.argv) != 4:
+        sys.stderr.write('USAGE: nnet.py recognize [mfcc file] [weights file]\n')
         sys.exit(1)
 
-    makeXY = getXYmaker(sys.argv[2])
-
-    mfcc_file = open(sys.argv[3], 'rb') if sys.argv[3] != '-' else sys.stdin
+    mfcc_file = open(sys.argv[2], 'rb') if sys.argv[3] != '-' else sys.stdin
     reader = MFCCReader(mfcc_file)
 
-    with open(sys.argv[4], 'rb') as f:
+    with open(sys.argv[3], 'rb') as f:
         W = pickle.load(f)
-        lblnames = W['lblnames']
+        labelnames = W['labelnames']
+        makeXY = getXYmaker(W['mode'])
         W = W['weights']
+
 
     for packet in reader:
         if isinstance(packet, GroupHeaderPacket):
             print '\n\n# label %s (file %s, offset %d)' % (packet.label, packet.filename, packet.sample_offset)
-            print ' '.join(lblnames)
+            print '\t'.join(labelnames)
             continue
 
         if not isinstance(packet, FramePacket):
@@ -100,71 +104,87 @@ def recognize():
             mels = np.matrix(packet.mel_powers).T,
             dcts = np.matrix(packet.dct_coeffs).T,
             wvls = np.matrix(packet.wvl_coeffs).T,
-            labels = np.matrix(np.zeros( (6,1) ))
+            labels = np.matrix(np.zeros( (7,1) ))
         )
         X, Y = makeXY(dataset)
 
-        C = nnet(W, X, Y, justAnswer=True) * np.exp(packet.dct_coeffs[0]*0.23025851)
+        C = nnet(W, X, Y, justAnswer=True)
         C = [ str(float(C[i])) for i in xrange(C.shape[0]) ]
-        print ' '.join(C)
+        print '\t'.join(C)
 
 def test():
-    if len(sys.argv) != 5:
-        sys.stderr.write('USAGE: nnet.py test [dcts|wvls|mels] [test file] [weights file]\n')
+    if len(sys.argv) != 4:
+        sys.stderr.write('USAGE: nnet.py test [test file] [weights file]\n')
         sys.exit(1)
 
-    makeXY = getXYmaker(sys.argv[2])
-
-    with open(sys.argv[3], 'rb') as f:
+    with open(sys.argv[2], 'rb') as f:
         test = pickle.load(f)
-    with open(sys.argv[4], 'rb') as f:
+    with open(sys.argv[3], 'rb') as f:
         W = pickle.load(f)
+        makeXY = getXYmaker(W['mode'])
+        labelnames = W['labelnames']
         W = W['weights']
 
     X, Y = makeXY(test)
 
-    errs, total = check_classifier(X,Y,W)
-    print 'made %d errors out of %d; accuracy %.1f%%' % (errs, total, 100. - 100.*errs/total)
+    total, errcnt, histo = check_classifier(X,Y,W)
+    print 'made %d errors out of %d; accuracy %.1f%%' % (errcnt, total, 100. - 100.*errcnt/total)
+
+    for label in labelnames:
+        sys.stdout.write('\t' + label)
+    print
+    for i,label in enumerate(labelnames):
+        sys.stdout.write(label)
+        total = errcnt = 0
+        for j in xrange(len(labelnames)):
+            sys.stdout.write('\t%d' % histo[(i,j)] )
+            total += histo[(i,j)]
+            if i != j:
+                errcnt += histo[(i,j)]
+        print '\t(%.1f%%)' % (100. - 100.*errcnt/total)
+
 
 def learn():
-    if len(sys.argv) != 6:
-        sys.stderr.write('USAGE: nnet.py learn [dcts|wvls|mels] [mean file] [training file] [weights file]\n')
+    if len(sys.argv) != 5:
+        sys.stderr.write('USAGE: nnet.py learn [new-mels|new-dcts|new-wvls|initial weights file] [training file] [output weights file]\n')
         sys.exit(1)
 
-    makeXY = getXYmaker(sys.argv[2])
+    new = sys.argv[2] in ('new-mels', 'new-dcts', 'new-wvls')
+    if new:
+        factr = 1e7
+        mode = sys.argv[2][4:]
+    else:
+        factr = 1e10
+        with open(sys.argv[2], 'rb') as f:
+            W = pickle.load(f)
+            mode = W['mode']
+            W = W['weights']
 
     with open(sys.argv[3], 'rb') as f:
-        mean = pickle.load(f)
-    with open(sys.argv[4], 'rb') as f:
         training = pickle.load(f)
 
-    X, Y = makeXY(mean)
-
+    makeXY = getXYmaker(mode)
+    X, Y = makeXY(training)
     inputs = X.shape[0]
     outputs = Y.shape[0]
 
-    W = np.random.rand(outputs*(inputs+1))
-    W = W * 0.6 - 0.3
-    
-    print ' ---- initial training ---- '
-    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y))
-    print 'loss: %f' % value
-    print 'weights:\n%r' % W
-    print 'notes:\n%r' % info
-    print
-    
-    X, Y = makeXY(training)
+    if new:
+        W = np.random.rand(outputs*(inputs+1))
+        W = W * 0.6 - 0.3
 
-    print ' ---- real training ---- '
-    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y))
+    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y), factr=factr)
     print 'loss: %f' % value
     print 'weights:\n%r' % W
     print 'notes:\n%r' % info
     print
 
-    with open(sys.argv[5], 'wb') as f:
-        pickle.dump(dict(weights = W, lblnames = training['lblnames']), f, -1)
-    print 'dumped weights to %s' % sys.argv[5]
+    with open(sys.argv[4], 'wb') as f:
+        pickle.dump(dict(
+            weights = W,
+            labelnames = training['labelnames'],
+            mode = mode),
+            f, -1)
+    print 'dumped weights to %s' % sys.argv[4]
 
 def main():
     if len(sys.argv) >= 2:

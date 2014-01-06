@@ -116,7 +116,7 @@ class PoorPlotter(gtk.DrawingArea):
                 else:
                     cr.line_to(px,py)
 
-        cr.set_source_rgba(0., 0., 0., .015)
+        cr.set_source_rgba(0., 0., 0., .03)
         for x in self._mel_data:
             plot_line(x)
             cr.stroke()

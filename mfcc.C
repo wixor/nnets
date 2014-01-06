@@ -20,10 +20,10 @@ static struct {
     float mel_power_threshold;
 } config = {
     .streamer_buffer = 8192,
-    .frame_sec = 0.025f,
-    .step_sec = 0.010f,
-    .mel_filters = 26,
-    .mel_high_freq = 8000.f,
+    .frame_sec = 0.015f,
+    .step_sec = 0.005f,
+    .mel_filters = 21,
+    .mel_high_freq = 4270.f,
     .mel_power_threshold = -70.f,
 };
 
@@ -52,10 +52,11 @@ static inline float db_to_power(float p) {
 #define WAVELET_BORDER 6
 
 static inline float wavelet_predict(float a, float b, float c, float d) {
-    return (9.f * (a + b) - (c + d)) * 0.0625;
+    /* return (9.f * (a + b) - (c + d)) * 0.0625; */
+    return .5f * (a + b);
 }
 static inline float wavelet_update(float a, float b, float c, float d) {
-    return .5f * (a + b);
+    return .25f * (a + b);
 }
 
 static void wavelet_mirror(float *aux, int n)
@@ -721,7 +722,7 @@ void outstream::write_profile(const mfcc &mfcc, bool _fft)
     out_short(mfcc.p.frame_spacing);
     out_short(mfcc.p.sample_rate);
 
-    out_buf(mfcc.mel_freqs, sizeof(float)*mfcc.p.mel_filters);
+    out_buf(mfcc.mel_freqs, sizeof(float)*(mfcc.p.mel_filters+2));
     if(fft) out_buf(mfcc.fft_freqs, sizeof(float)*mfcc.fft_length);
 }
 void outstream::write_group_hdr(const char *filename, const char *label, int sample_offset)
