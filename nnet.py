@@ -67,46 +67,33 @@ def check_classifier(X,Y,W):
 
 ### ----------------------------------------------------------------------- ###
 
-def getXYmaker(mode):
-    if 'dcts' == mode:
-        return lambda dataset: (dataset['dcts'][1:9, ], dataset['labels'])
-    if 'wvls' == mode:
-        return lambda dataset: (dataset['wvls'][1:9, ], dataset['labels'])
-    if 'mels' == mode:
-        return lambda dataset: (dataset['mels'], dataset['labels'])
-    raise ValueError('unexpected mode: %s; must be dcts, wvls or mels' % mode)
-
 def recognize():
     if len(sys.argv) != 4:
         sys.stderr.write('USAGE: nnet.py recognize [mfcc file] [weights file]\n')
         sys.exit(1)
 
-    mfcc_file = open(sys.argv[2], 'rb') if sys.argv[3] != '-' else sys.stdin
+    mfcc_file = oread(sys.argv[2])
     reader = MFCCReader(mfcc_file)
 
     with open(sys.argv[3], 'rb') as f:
         W = pickle.load(f)
         labelnames = W['labelnames']
-        makeXY = getXYmaker(W['mode'])
+        mode = W['mode']
         W = W['weights']
 
+    makeX = xmaker(mode)
+
+    Y = np.matrix(np.zeros(len(labelnames))).T
 
     for packet in reader:
-        if isinstance(packet, GroupHeaderPacket):
-            print '\n\n# label %s (file %s, offset %d)' % (packet.label, packet.filename, packet.sample_offset)
+        if isinstance(packet, ProfilePacket):
             print '\t'.join(labelnames)
             continue
-
-        if not isinstance(packet, FramePacket):
+        if isinstance(packet, GroupHeaderPacket):
+            print '# label %s (file %s, offset %d)' % (packet.label, packet.filename, packet.sample_offset)
             continue
 
-        dataset = dict(
-            mels = np.matrix(packet.mel_powers).T,
-            dcts = np.matrix(packet.dct_coeffs).T,
-            wvls = np.matrix(packet.wvl_coeffs).T,
-            labels = np.matrix(np.zeros( (7,1) ))
-        )
-        X, Y = makeXY(dataset)
+        X = np.matrix(makeX(packet)).T
 
         C = nnet(W, X, Y, justAnswer=True)
         C = [ str(float(C[i])) for i in xrange(C.shape[0]) ]
@@ -119,13 +106,18 @@ def test():
 
     with open(sys.argv[2], 'rb') as f:
         test = pickle.load(f)
+        mode = test['mode']
+        X = test['X']
+        Y = test['Y']
+        labelnames = test['labelnames']
+
     with open(sys.argv[3], 'rb') as f:
         W = pickle.load(f)
-        makeXY = getXYmaker(W['mode'])
-        labelnames = W['labelnames']
+        if W['mode'] != mode:
+            raise ValueError('mode mismatch; test file has %s, but nnet file has %s' % (mode, W['mode'])
+        if W['labelnames'] != labelnames:
+            raise ValueError('label names mismatch')
         W = W['weights']
-
-    X, Y = makeXY(test)
 
     total, errcnt, histo = check_classifier(X,Y,W)
     print 'made %d errors out of %d; accuracy %.1f%%' % (errcnt, total, 100. - 100.*errcnt/total)
@@ -145,34 +137,23 @@ def test():
 
 
 def learn():
-    if len(sys.argv) != 5:
-        sys.stderr.write('USAGE: nnet.py learn [new-mels|new-dcts|new-wvls|initial weights file] [training file] [output weights file]\n')
+    if len(sys.argv) != 4:
+        sys.stderr.write('USAGE: nnet.py learn [training file] [output weights file]\n')
         sys.exit(1)
 
-    new = sys.argv[2] in ('new-mels', 'new-dcts', 'new-wvls')
-    if new:
-        factr = 1e7
-        mode = sys.argv[2][4:]
-    else:
-        factr = 1e10
-        with open(sys.argv[2], 'rb') as f:
-            W = pickle.load(f)
-            mode = W['mode']
-            W = W['weights']
-
-    with open(sys.argv[3], 'rb') as f:
+    with open(sys.argv[2], 'rb') as f:
         training = pickle.load(f)
-
-    makeXY = getXYmaker(mode)
-    X, Y = makeXY(training)
+    
+    mode = training['mode']
+    X = training['X']
+    Y = training['Y']
     inputs = X.shape[0]
     outputs = Y.shape[0]
 
-    if new:
-        W = np.random.rand(outputs*(inputs+1))
-        W = W * 0.6 - 0.3
+    W = np.random.rand(outputs*(inputs+1))
+    W = W * 0.6 - 0.3
 
-    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y), factr=factr)
+    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y), factr=1e11)
     print 'loss: %f' % value
     print 'weights:\n%r' % W
     print 'notes:\n%r' % info

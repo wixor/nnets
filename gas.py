@@ -1,6 +1,6 @@
 #!./python
 
-import sys, itertools, collections, multiprocessing
+import sys, itertools, collections, multiprocessing, time
 import numpy as np
 import cPickle as pickle
 from common import *
@@ -32,8 +32,9 @@ def analyze():
 
     with open(sys.argv[2], 'rb') as f:
         data = pickle.load(f)
-    mode = data['mode']
-    F = data['F']
+        mode = data['mode']
+        F = data['F']
+        del data
 
     with oread(sys.argv[3]) as in_file:
         frames = MFCCReader(in_file).read_all()[2]
@@ -85,9 +86,10 @@ def score():
 
     with open(sys.argv[2], 'rb') as f:
         data = pickle.load(f)
-    makeX = xmaker(data['mode'])
-    F = data['F']
-    E = data['E']
+        makeX = xmaker(data['mode'])
+        F = data['F']
+        E = data['E']
+        del data
 
     label = sys.argv[3]
 
@@ -97,17 +99,23 @@ def score():
     framehits = np.zeros(F.shape[0], dtype=np.int32)
     grouphits = np.zeros(F.shape[0], dtype=np.int32)
     colours = np.zeros(F.shape[0], dtype=np.int32)
+    proxim2 = np.zeros(F.shape[0], dtype=np.float32)
+    proxim = np.zeros(F.shape[0], dtype=np.float32)
 
     c = 0
     for packet in reader:
         if isinstance(packet, GroupHeaderPacket):
             c += 1
+            proxim2 += proxim
+            proxim.fill(np.inf)
         if not isinstance(packet, FramePacket):
             continue
         if packet.group_header.label != label:
             continue
 
-        idx, dist = classify(makeX(packet), F)
+        X = makeX(packet)
+        proxim = np.fmin(proxim, pythag(X-F))
+        idx, dist = classify(X, F)
 
         print 'file %s, offset %d;  class %d dist %f' % (
             packet.group_header.filename, packet.sample_offset,
@@ -118,13 +126,16 @@ def score():
             colours[idx] = c
             grouphits[idx] += 1
 
-    perm = np.argsort(grouphits)[::-1]
+    proxim2 += proxim
+    proxim2 /= float(c)
+
+    perm = np.argsort(proxim2)
 
     print 'selected group: %d' % perm[0]
-    print '  class         err          frames          groups'
+    print '  class         err          frames          groups          proxim'
     for i in perm:
-        print '%7d %15.5f %15d %15d' % (
-            i, E[i], framehits[i], grouphits[i] )
+        print '%7d %15.5f %15d %15d %15.5f' % (
+            i, E[i], framehits[i], grouphits[i], proxim2[i] )
 
 ### ----------------------------------------------------------------------- ###
 
@@ -161,8 +172,9 @@ def filter():
 
     with open(sys.argv[2], 'rb') as f:
         data = pickle.load(f)
-    makeX = xmaker(data['mode'])
-    F = data['F']
+        makeX = xmaker(data['mode'])
+        F = data['F']
+        del data
 
     classes = [ int(x.strip()) for x in sys.argv[3].split(',') ]
 
@@ -180,6 +192,7 @@ def filter():
         elif isinstance(packet, GroupHeaderPacket):
             best.flush(writer)
         else:
+            #dist = np.min(pythag(makeX(packet) - F[classes]))
             idx, dist = classify(makeX(packet), F)
             if idx in classes:
                 best.consider(packet, dist)
@@ -239,33 +252,36 @@ def learn_worker(arg):
           '# [%d] cluster size deviation: %f' % (
                 ncount, np.average(dist), np.median(dist),
                 ncount, np.std(count) )
+    sys.stdout.flush()
     
     return F, E
 
 def learn():
     if len(sys.argv) != 5:
-        sys.stderr.write('USAGE: gas.py learn [mels|dcts|wvls] [training mfcc file] [output gas file]\n')
+        sys.stderr.write('USAGE: gas.py learn [mode] [training mfcc file] [output gas file]\n')
         sys.exit(1)
 
+    print '# reading input...'
     mode = sys.argv[2]
     makeX = xmaker(mode)
 
-    print '# reading input...'
     with oread(sys.argv[3]) as in_file:
-        frames = MFCCReader(in_file).read_all()[2]
+        X = []
+        for packet in MFCCReader(in_file):
+            if isinstance(packet, FramePacket):
+                X.append(makeX(packet))
+        X = np.vstack(X)
 
-    X = np.vstack(map(makeX, frames))
+    #F, E = learn_worker( (X,200) )
 
-    F, E = learn_worker( (X,60) )
+    pool = multiprocessing.Pool(processes=4)
+    pool.map(learn_worker, [(X,ncount) for ncount in xrange(10,151,2)], 1)
+    pool.close()
+    pool.join()
+    return
 
-    #pool = multiprocessing.Pool(processes=4)
-    #pool.map(learn_worker, [(X,ncount) for ncount in xrange(10,151,2)], 1)
-    #pool.close()
-    #pool.join()
-    #return
-
-    with open(sys.argv[4], 'wb') as f:
-        pickle.dump(dict(mode=mode, F = F, E = E), f, -1)
+    with owrite(sys.argv[4]) as f:
+        pickle.dump(dict(mode = mode, F = F, E = E), f, -1)
 
 def main():
     if len(sys.argv) >= 2:

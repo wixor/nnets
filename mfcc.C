@@ -20,7 +20,7 @@ static struct {
     float mel_power_threshold;
 } config = {
     .streamer_buffer = 8192,
-    .frame_sec = 0.015f,
+    .frame_sec = 0.020f,
     .step_sec = 0.005f,
     .mel_filters = 21,
     .mel_high_freq = 4270.f,
@@ -45,76 +45,6 @@ static inline float power_to_db(float p) {
 }
 static inline float db_to_power(float p) {
     return expf(0.23025851f * p);
-}
-
-/* ------------------------------------------------------------------------- */
-
-#define WAVELET_BORDER 6
-
-static inline float wavelet_predict(float a, float b, float c, float d) {
-    /* return (9.f * (a + b) - (c + d)) * 0.0625; */
-    return .5f * (a + b);
-}
-static inline float wavelet_update(float a, float b, float c, float d) {
-    return .25f * (a + b);
-}
-
-static void wavelet_mirror(float *aux, int n)
-{
-    aux[-1] = aux[1];
-    aux[n] = aux[n-2];
-    aux[-2] = aux[2];
-    aux[n+1] = aux[n-3];
-    aux[-3] = aux[3];
-    aux[n+2] = aux[n-4];
-}
-
-static inline void wavelet_forward_step(float *buf, float *aux, int n)
-{
-    memcpy(aux, buf, n*sizeof(float));
-    
-    wavelet_mirror(aux, n);
-    for(int i=1; i<n; i+=2)
-        aux[i] -= wavelet_predict(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
-    
-    wavelet_mirror(aux, n);
-    for(int i=0; i<n; i+=2)
-        aux[i] += wavelet_update(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
-    
-    for(int i=0; 2*i<n; i++)
-        buf[i] = aux[2*i];
-    for(int i=0; 2*i+1<n; i++)
-        buf[i + (n+1)/2] = aux[2*i+1];
-}
-static inline void wavelet_backward_step(float *buf, float *aux, int n)
-{
-    for(int i=0; 2*i<n; i++)
-        aux[2*i] = buf[i];
-    for(int i=0; 2*i+1<n; i++)
-        aux[2*i+1] = buf[i + (n+1)/2];
-
-    wavelet_mirror(aux, n);
-    for(int i=0; i<n; i+=2)
-        aux[i] -= wavelet_update(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
-    
-    wavelet_mirror(aux, n);
-    for(int i=1; i<n; i+=2)
-        aux[i] += wavelet_predict(aux[i-1], aux[i+1], aux[i-3], aux[i+3]);
-   
-    memcpy(buf, aux, sizeof(float)*n); 
-}
-
-static void wavelet_forward(float *buf, float *aux, int n) {
-    if(n < 2)
-        return;
-    wavelet_forward_step(buf, aux+(WAVELET_BORDER/2), n);
-    wavelet_forward(buf, aux, (n+1)/2);
-}
-static void wavelet_backward(float *buf, float *aux, int n) {
-    if(n < 2)
-        return;
-    wavelet_backward(buf, aux, (n+1)/2);
-    wavelet_backward_step(buf, aux+(WAVELET_BORDER/2), n);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -156,14 +86,9 @@ public:
     fftw_complex *fft_in, *fft_out;
     fftw_plan fft_plan;
 
-    double *dct_in, *dct_out;
-    fftw_plan dct_plan;
-
     float *window;
     float *fft_freqs, *fft_power;
     float *mel_freqs, *mel_power;
-    float *dct_coeffs;
-    float *wvl_coeffs, *wvl_aux;
 
     mfcc(const struct mfcc::profile &_p);
     ~mfcc();
@@ -179,11 +104,7 @@ mfcc::mfcc(const struct mfcc::profile &_p)
     fft_in = fftw_alloc_complex(p.frame_length);
     fft_out = fftw_alloc_complex(p.frame_length);
 
-    dct_in = (double *)malloc(sizeof(double) * p.mel_filters);
-    dct_out = (double *)malloc(sizeof(double) * p.mel_filters);
-
     fft_plan = fftw_plan_dft_1d(p.frame_length, fft_in, fft_out, FFTW_FORWARD, FFTW_MEASURE);
-    dct_plan = fftw_plan_r2r_1d(p.mel_filters, dct_in, dct_out, FFTW_REDFT10, FFTW_MEASURE);
 
     window = (float *)malloc(sizeof(float) * p.frame_length);
     
@@ -194,11 +115,6 @@ mfcc::mfcc(const struct mfcc::profile &_p)
     mel_freqs = (float *)malloc(sizeof(float) * (p.mel_filters+2));
     mel_power = (float *)malloc(sizeof(float) * p.mel_filters);
    
-    dct_coeffs = (float *)malloc(sizeof(float) * p.mel_filters);
-    
-    wvl_coeffs = (float *)malloc(sizeof(float) * p.mel_filters);
-    wvl_aux = (float *)malloc(sizeof(float) * (p.mel_filters + WAVELET_BORDER));
-
     /* Hann's window */
     for(int i=0; i<p.frame_length; i++)
         window[i] = .5f - .5f*cosf((float)(2. * M_PI) * i / p.frame_length);
@@ -214,11 +130,6 @@ mfcc::mfcc(const struct mfcc::profile &_p)
 
 mfcc::~mfcc()
 {
-    free(wvl_aux);
-    free(wvl_coeffs);
-
-    free(dct_coeffs);
-
     free(mel_power);
     free(mel_freqs);
 
@@ -227,11 +138,7 @@ mfcc::~mfcc()
 
     free(window);
 
-    fftw_destroy_plan(dct_plan);
     fftw_destroy_plan(fft_plan);
-
-    free(dct_out);
-    free(dct_in);
 
     fftw_free(fft_out);
     fftw_free(fft_in);
@@ -276,18 +183,11 @@ void mfcc::process_frame(const sample_t *samples)
                 ((freq < mid)  ?  (freq-lo) / (mid-lo) :  (high-freq) / (high-mid));
         }
         
-        dct_in[j] = mel_power[j] = power_to_db(accum + mel_power_offs);
+        mel_power[j] = power_to_db(accum + mel_power_offs);
     }
 
     for(int i=0; i<fft_length; i++)
         fft_power[i] = power_to_db(fft_power[i]);
-
-    fftw_execute(dct_plan);
-    for(int i=0; i<p.mel_filters; i++)
-        dct_coeffs[i] = dct_out[i] / (2*p.mel_filters);
-
-    memcpy(wvl_coeffs, mel_power, sizeof(float)*p.mel_filters);
-    wavelet_forward(wvl_coeffs, wvl_aux, p.mel_filters);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -677,6 +577,9 @@ class outstream
     inline void out_buf(const void *data, size_t len) {
         fwrite(data, len, 1, get_fp());
     }
+    inline void out_float(float x) {
+        out_buf(&x, sizeof(x));
+    }
     inline void out_int(uint32_t x) {
         out_buf(&x, sizeof(x));
     }
@@ -721,6 +624,7 @@ void outstream::write_profile(const mfcc &mfcc, bool _fft)
     out_short(mfcc.p.frame_length);
     out_short(mfcc.p.frame_spacing);
     out_short(mfcc.p.sample_rate);
+    out_float(mfcc.p.mel_power_threshold);
 
     out_buf(mfcc.mel_freqs, sizeof(float)*(mfcc.p.mel_filters+2));
     if(fft) out_buf(mfcc.fft_freqs, sizeof(float)*mfcc.fft_length);
@@ -745,8 +649,6 @@ void outstream::write_frame(const mfcc &mfcc)
 
     out_buf(mfcc.mel_power,  sizeof(float)*mfcc.p.mel_filters);
     if(fft) out_buf(mfcc.fft_power,  sizeof(float)*mfcc.fft_length);
-    out_buf(mfcc.dct_coeffs, sizeof(float)*mfcc.p.mel_filters);
-    out_buf(mfcc.wvl_coeffs, sizeof(float)*mfcc.p.mel_filters);
 }
 
 /* -------------------------------------------------------------------------- */

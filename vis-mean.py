@@ -135,7 +135,7 @@ def main():
     profiles, _, frames = reader.read_all()
     profile = profiles[0]
 
-    mel_data = [ zip(profile.mel_freqs, f.mel_powers)
+    mel_data = [ zip(profile.mel_freqs[1:], f.mel_powers)
                 for f in frames if f.group_header.label == label ]
 
     vis = PoorPlotter()
