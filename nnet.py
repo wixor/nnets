@@ -114,7 +114,7 @@ def test():
     with open(sys.argv[3], 'rb') as f:
         W = pickle.load(f)
         if W['mode'] != mode:
-            raise ValueError('mode mismatch; test file has %s, but nnet file has %s' % (mode, W['mode'])
+            raise ValueError('mode mismatch; test file has %s, but nnet file has %s' % (mode, W['mode']))
         if W['labelnames'] != labelnames:
             raise ValueError('label names mismatch')
         W = W['weights']
@@ -153,19 +153,19 @@ def learn():
     W = np.random.rand(outputs*(inputs+1))
     W = W * 0.6 - 0.3
 
-    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y), factr=1e11)
+    W, value, info = scipy.optimize.fmin_l_bfgs_b(nnet, W, args=(X,Y), factr=1e10)
     print 'loss: %f' % value
     print 'weights:\n%r' % W
     print 'notes:\n%r' % info
     print
 
-    with open(sys.argv[4], 'wb') as f:
+    with open(sys.argv[3], 'wb') as f:
         pickle.dump(dict(
             weights = W,
             labelnames = training['labelnames'],
             mode = mode),
             f, -1)
-    print 'dumped weights to %s' % sys.argv[4]
+    print 'dumped weights to %s' % sys.argv[3]
 
 def main():
     if len(sys.argv) >= 2:

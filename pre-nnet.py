@@ -17,6 +17,8 @@ class Dataset(object):
         self.Y = []
 
     def addFrame(self, frame):
+        if is_clipped(frame):
+            return
         self.profile = self.profile or frame.group_header.profile
         self.X.append(self.makeX(frame))
         self.Y.append(frame.group_header.label)
@@ -35,31 +37,38 @@ class Dataset(object):
         sys.stderr.write('  label frequencies: %r\n' % labelfreq)
         sys.stderr.write('  rarest label has frequency %d\n' % minfreq)
 
+        fraction = .5
         r = np.random.random(size = self.n)
-        selector = [ r[i] <= 1. * minfreq / labelfreq[self.Y[i]] for i in xrange(self.n) ]
+        selector = [ r[i] <= fraction * minfreq / labelfreq[self.Y[i]] for i in xrange(self.n) ]
 
         self.X = [ x for (i,x) in enumerate(self.X) if selector[i] ]
         self.Y = [ y for (i,y) in enumerate(self.Y) if selector[i] ]
         self.n = len(self.X)
 
         sys.stderr.write('  adding silence\n')
-        self.add_silence(minfreq)
+        self.add_silence(int(fraction*minfreq))
 
         labelfreq = collections.Counter(self.Y)
 
         sys.stderr.write('  remaining samples: %d\n' % self.n)
         sys.stderr.write('  adjusted frequencies: %r\n' % labelfreq)
 
-    def add_silence(self, rep, v=-70):
-        packet = FramePacket(
-            seq = 0, group_header = None, fft_powers = [], sample_offset = 0,
-            mel_powers = [ v ] * self.profile.mel_filters
-        )
+    def add_silence(self, rep):
+        mel_filters = self.profile.mel_filters
+        silence = self.profile.mel_power_threshold
+        noise = 10.
 
-        x = self.makeX(packet)
-        self.X.extend(itertools.repeat(x, rep))
-        self.Y.extend(itertools.repeat('sil', rep))
-        self.n += rep
+        for i in xrange(rep):
+            mel_powers = list(np.random.uniform(silence, silence+noise, mel_filters))
+
+            packet = FramePacket(
+                seq = 0, group_header = None, fft_powers = [], sample_offset = 0,
+                mel_powers = mel_powers
+            )
+
+            self.X.append(self.makeX(packet))
+            self.Y.append('sil')
+            self.n += 1
 
     def numpyfy(self, labelnames):
         sys.stderr.write('numpyfying...\n')
@@ -91,18 +100,16 @@ class Dataset(object):
                 f, -1)
 
 def main():
-    if len(sys.argv) < 4:
-        sys.stderr.write('USAGE: pre-nnet.py [mode] [output pickle file] [input mfcc files]... \n')
+    if len(sys.argv) != 4:
+        sys.stderr.write('USAGE: pre-nnet.py [mode] [output pickle file] [input mfcc file]\n')
         sys.exit(1)
 
     dataset = Dataset(sys.argv[1])
 
-    for in_filename in sys.argv[3:]:
-        print 'reading file %s...' % in_filename
-        with oread(in_filename) as in_file:
-            for packet in MFCCReader(in_file):
-                if isinstance(packet, FramePacket):
-                    dataset.addFrame(packet)
+    with oread(sys.argv[3]) as in_file:
+        for packet in MFCCReader(in_file):
+            if isinstance(packet, FramePacket):
+                dataset.addFrame(packet)
 
     dataset.equalize()
 

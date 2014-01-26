@@ -116,7 +116,7 @@ class PoorPlotter(gtk.DrawingArea):
                 else:
                     cr.line_to(px,py)
 
-        cr.set_source_rgba(0., 0., 0., .03)
+        cr.set_source_rgba(0., 0., 0., .02)
         for x in self._mel_data:
             plot_line(x)
             cr.stroke()
@@ -137,6 +137,8 @@ def main():
 
     mel_data = [ zip(profile.mel_freqs[1:], f.mel_powers)
                 for f in frames if f.group_header.label == label ]
+    step = int(len(mel_data) / 2000)
+    mel_data = mel_data[::step]
 
     vis = PoorPlotter()
     vis.set_data(mel_data = mel_data, label = "mean for label " + label)

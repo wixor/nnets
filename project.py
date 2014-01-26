@@ -25,12 +25,12 @@ def main():
 
     X = np.vstack(X)
 
-    idcs = xrange(X.shape[0])
-    if True:
-    #s = min(map(len, L.itervalues()))
-    #for label, idcs in L.iteritems():
-        #idcs = np.random.choice(idcs, s, replace=False)
-        #print '"%s"' % label
+    #idcs = xrange(X.shape[0])
+    #if True:
+    s = min(map(len, L.itervalues()))
+    for label, idcs in L.iteritems():
+        idcs = np.random.choice(idcs, s, replace=False)
+        print '"%s"' % label
         for i in idcs:
             print '%f %f %f' % (X[i,0],X[i,1],X[i,2])
         print
